@@ -1,0 +1,12 @@
+{
+  "display_name": "台账填表缓存适配",
+  "loading_order": 150,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "yuan-1992-png",
+  "version": "0.2.0",
+  "homePage": "https://github.com/yuan-1992-png/ST-Ledger-Cache-Layout",
+  "auto_update": false
+}

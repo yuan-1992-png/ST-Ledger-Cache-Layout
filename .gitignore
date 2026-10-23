@@ -1,0 +1,10 @@
+node_modules/
+*.log
+*.zip
+private/
+local/
+request.json
+*.har
+settings.json
+test-results/
+.DS_Store
