@@ -1,9 +1,9 @@
 {
   "date": "2026-10-24",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "ledger": "V1.147",
   "unitTests": {
-    "passed": 18,
+    "passed": 24,
     "failed": 0
   },
   "browser": {
@@ -30,9 +30,24 @@
     "inMemoryPersistence": true,
     "realChatFilesWritten": false
   },
+  "hybrid": {
+    "version": "0.1.1",
+    "host": "V1.147",
+    "tables": 20,
+    "preservedOriginal18Columns": true,
+    "preservedOriginal18Worldbook": true,
+    "preservedOriginal18Frequencies": true,
+    "mvuWritePreservesOtherTables": true,
+    "reloadKeepsAllTablesAndValues": true,
+    "liveDataWritten": false,
+    "semanticSynchronization": false,
+    "realModelTested": false
+  },
   "limits": [
     "Synthetic fixtures; no paid model calls",
     "No user chat modified",
+    "No automatic semantic field synchronization",
+    "No full automatic-fill Schema validation",
     "No end-to-end AI accuracy evaluation",
     "No full regression of phone or status-bar features"
   ],

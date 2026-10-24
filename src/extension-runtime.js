@@ -4954,7 +4954,7 @@ function installExtensionRuntime(window) {
         if (!core || typeof core.convert !== 'function') {
             throw new Error('转换核心未加载（MVU2LEDGER_CORE 不可用）');
         }
-        const mode = 'sqlite';
+        const mode = 'native';
         const opts = {
             mode,
             targetSpVersion: await readTargetSpVersion(),
@@ -5156,15 +5156,21 @@ function installExtensionRuntime(window) {
             toast('转换核心不可用', 'error');
             return;
         }
-        const manualPlan = conversionProfileTools.planManualMerge({
-            template: lastResult.template, sourceTemplate: mergeState.sourceTemplate, selected: checked,
-            source: mergeState.source, priorRefs: mergeState.appliedRefs,
-        });
+        let manualPlan;
+        try {
+            manualPlan = conversionProfileTools.planManualMerge({
+                template: lastResult.template, sourceTemplate: mergeState.sourceTemplate, selected: checked,
+                source: mergeState.source, priorRefs: mergeState.appliedRefs,
+            });
+        } catch (error) {
+            toast('合并失败：' + error.message, 'error');
+            return;
+        }
         const merged = manualPlan.merged;
         dbg(' applyMergeTables: 勾选=' + checked.join('、') + ' | 新增=' + merged.added.join('、') + ' | 跳过=' + merged.skipped.join('、') + ' | 合并后表数=' + Object.keys(merged.template).filter(k => k.startsWith('sheet_')).length);
         if (!merged.added.length) { toast('没有可并入的表（全部重名或无效）', 'error'); return; }
         const settings = getSettings();
-        const mode = 'sqlite';
+        const mode = 'native';
         const opts = {
             mode,
             template: merged.template,
@@ -5186,7 +5192,7 @@ function installExtensionRuntime(window) {
             mergeState.appliedRefs = manualPlan.refs;
             renderResult(result);
             dbg(' applyMergeTables 产物更新完成: meta.tableCount=' + result.meta.tableCount + ' | tableNames=' + result.meta.tableNames.join('、'));
-            const msg = '合并完成：新增 ' + merged.added.length + ' 张表' + (merged.skipped.length ? '，跳过重名：' + merged.skipped.join('、') : '');
+            const msg = '合并完成：新增 ' + merged.added.length + ' 张表；已保留原台账分组和注入设置。重叠字段尚未自动同步，请先用新聊天测试。' + (merged.skipped.length ? '，跳过重名：' + merged.skipped.join('、') : '');
             if (status) status.textContent = msg;
             toast(msg, 'info');
             // 刷新勾选列表：已并入的表标记为“已存在”

@@ -3099,6 +3099,10 @@
      * 返回 { template, added, skipped }；重名表跳过（插件校验表名唯一），uid 冲突自动加后缀。
      */
     function mergeTemplates(base, source, selectedUids) {
+        if(base?.mate?.mvuLedger?.version===1){
+            const factory=typeof require==='function'?require('./ledger-template.js'):root.__MVU2LEDGER_LEDGER_TEMPLATE_FACTORY__;
+            return factory().merge(base,source,selectedUids);
+        }
         const merged = JSON.parse(JSON.stringify(base && typeof base === 'object' ? base : {}));
         if (!merged.mate) {
             merged.mate = {
@@ -3340,7 +3344,7 @@
             js: 'index.js',
             css: 'style.css',
             author: 'yuan-1992-png; based on wmdl2/mvu2shujuku contributors',
-            version: '0.1.0',
+            version: '0.1.1',
             homePage: 'https://github.com/yuan-1992-png/ST-Ledger-Cache-Layout/tree/mvu-ledger',
             auto_update: false,
             minimum_client_version: '1.12.0',

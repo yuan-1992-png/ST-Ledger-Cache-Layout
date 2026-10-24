@@ -63,7 +63,7 @@ function createLedgerHost(ledger, getContext) {
         return serial(async c => { const value = clone(snapshot()); owned(value); const key = keys(value).find(k=>k===table || value[k].name===table); if (!key) throw new Error('未找到表：'+table); const result = edit(value[key]); await writeCandidate(value,c); return result; });
     }
     const api = {
-        __mvu_ledger__: true, version: 'MVU-Ledger/0.1.0',
+        __mvu_ledger__: true, version: 'MVU-Ledger/0.1.1',
         exportTableAsJson: snapshot,
         getTableTemplate: options => face.getTableTemplate(options),
         getTemplatePresetNames: () => face.getTemplatePresetNames(),
@@ -98,7 +98,7 @@ function createLedgerHost(ledger, getContext) {
                 if (!name.startsWith('MVU台账-')) throw new Error('模板名必须以 MVU台账- 开头，防止覆盖现有预设');
                 const old=face.getTemplatePresetNames().includes(name)?face.getTableTemplate({scope:'global',presetName:name}):null;
                 if(old) {
-                    const ruleSignature=v=>JSON.stringify(keys(v).sort().map(k=>[k,v[k].name,v[k].content[0],v[k].ledgerV2?.note,v[k].ledgerV2?.triggerNotes]));
+                    const ruleSignature=v=>JSON.stringify({groups:(v.mate?.ledgerGroups||[]).map(g=>[g.id,g.name,g.frequency]).sort((a,b)=>a[0]-b[0]),tables:keys(v).sort().map(k=>[k,v[k].name,v[k].content[0],v[k].ledgerV2?.groupId,v[k].ledgerV2?.note,v[k].ledgerV2?.triggerNotes])});
                     if(ruleSignature(old)!==ruleSignature(value))throw new Error('同名模板已存在且规则不同，请使用新名称');
                     return {success:true,scope:'global',message:'已有相同模板'};
                 }

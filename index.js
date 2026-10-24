@@ -61,7 +61,7 @@ globalThis.__MVU2LEDGER_LEDGER_HOST_FACTORY__ = (function createLedgerHost(ledge
         return serial(async c => { const value = clone(snapshot()); owned(value); const key = keys(value).find(k=>k===table || value[k].name===table); if (!key) throw new Error('未找到表：'+table); const result = edit(value[key]); await writeCandidate(value,c); return result; });
     }
     const api = {
-        __mvu_ledger__: true, version: 'MVU-Ledger/0.1.0',
+        __mvu_ledger__: true, version: 'MVU-Ledger/0.1.1',
         exportTableAsJson: snapshot,
         getTableTemplate: options => face.getTableTemplate(options),
         getTemplatePresetNames: () => face.getTemplatePresetNames(),
@@ -96,7 +96,7 @@ globalThis.__MVU2LEDGER_LEDGER_HOST_FACTORY__ = (function createLedgerHost(ledge
                 if (!name.startsWith('MVU台账-')) throw new Error('模板名必须以 MVU台账- 开头，防止覆盖现有预设');
                 const old=face.getTemplatePresetNames().includes(name)?face.getTableTemplate({scope:'global',presetName:name}):null;
                 if(old) {
-                    const ruleSignature=v=>JSON.stringify(keys(v).sort().map(k=>[k,v[k].name,v[k].content[0],v[k].ledgerV2?.note,v[k].ledgerV2?.triggerNotes]));
+                    const ruleSignature=v=>JSON.stringify({groups:(v.mate?.ledgerGroups||[]).map(g=>[g.id,g.name,g.frequency]).sort((a,b)=>a[0]-b[0]),tables:keys(v).sort().map(k=>[k,v[k].name,v[k].content[0],v[k].ledgerV2?.groupId,v[k].ledgerV2?.note,v[k].ledgerV2?.triggerNotes])});
                     if(ruleSignature(old)!==ruleSignature(value))throw new Error('同名模板已存在且规则不同，请使用新名称');
                     return {success:true,scope:'global',message:'已有相同模板'};
                 }
@@ -138,24 +138,76 @@ globalThis.__MVU2LEDGER_LEDGER_HOST_FACTORY__ = (function createLedgerHost(ledge
     return api;
 });
 globalThis.__MVU2LEDGER_LEDGER_TEMPLATE_FACTORY__ = (function createLedgerTemplate() {
+    const clone=value=>JSON.parse(JSON.stringify(value));
+    const sheetKeys=value=>Object.keys(value||{}).filter(key=>key.startsWith('sheet_'));
+    function merge(base,source,selected) {
+        const result=clone(base), src=source||{}, added=[], skipped=[];
+        const variableIds=result.mate?.mvuLedger?.variableTableIds||sheetKeys(base);
+        const names=new Set(sheetKeys(result).map(k=>String(result[k].name||'').trim()));
+        const imports=[];
+        for(const uid of [...new Set(selected||[])]){
+            const sheet=src[uid];if(!sheet)continue;
+            const name=String(sheet.name||'').trim();
+            if(names.has(name)){skipped.push(name);continue;}
+            if(!sheet.ledgerV2)throw new Error('来源表缺少台账原生定义，不能保留其分组和注入设置：'+name);
+            names.add(name);imports.push([uid,sheet]);
+        }
+        if(!imports.length)return{template:result,added,skipped};
+        const sourceGroups=src.mate?.ledgerGroups||[];
+        const required=new Set(imports.map(([,sheet])=>sheet.ledgerV2.groupId));
+        for(const id of required)if(!sourceGroups.some(g=>g.id===id))throw new Error('来源模板缺少分组定义：'+id);
+        const groups=clone(result.mate.ledgerGroups||[]);
+        const used=new Set([...groups,...sourceGroups].map(g=>g.id));
+        let next=Math.max(0,...used)+1;
+        for(const group of sourceGroups.filter(g=>required.has(g.id))){
+            const existing=groups.find(g=>g.id===group.id);
+            if(existing && JSON.stringify(existing)!==JSON.stringify(group)){
+                while(used.has(next))next++;
+                const old=existing.id;existing.id=next;used.add(next++);
+                for(const key of sheetKeys(result))if(result[key].ledgerV2?.groupId===old)result[key].ledgerV2.groupId=existing.id;
+            }
+            if(!groups.some(g=>g.id===group.id))groups.push(clone(group));
+        }
+        const importedKeys=[];
+        for(const [uid,sheet]of imports){
+            let key=uid,n=2;while(result[key])key=uid+'_'+n++;
+            const copy=clone(sheet);copy.uid=key;copy.ledgerV2.tableId=key;
+            // Only schema/rules are merged; never import records from another chat.
+            copy.content=[clone(sheet.content[0])];
+            result[key]=copy;importedKeys.push(key);added.push(sheet.name);
+        }
+        result.mate.mvuLedger={...result.mate.mvuLedger,variableTableIds:[...variableIds]};
+        result.mate.ledgerGroups=groups;
+        // Existing ecosystem tables are the foundation; MVU-only tables follow them.
+        const oldKeys=sheetKeys(base), ecosystem=oldKeys.filter(k=>!variableIds.includes(k));
+        const ordered=[...ecosystem,...importedKeys,...variableIds.filter(k=>result[k])];
+        const output={...result};for(const key of sheetKeys(output))delete output[key];
+        ordered.forEach((key,index)=>{const sheet=result[key];sheet.orderNo=index;sheet.ledgerV2.orderNo=index;output[key]=sheet;});
+        return{template:output,added,skipped};
+    }
     function adapt(template) {
         const keys=Object.keys(template).filter(k=>k.startsWith('sheet_'));
         if(!keys.length)throw new Error('没有可转换的变量表');
-        template.mate={...template.mate,mvuLedger:{version:1},ledgerGroups:[{id:1,name:'MVU变量',frequency:1},{id:2,name:'只读变量',frequency:0}]};
-        for(const key of keys){
+        const variableIds=template.mate?.mvuLedger?.variableTableIds||keys;
+        template.mate={...template.mate,mvuLedger:{...template.mate?.mvuLedger,version:1,variableTableIds:[...variableIds]},ledgerGroups:template.mate?.ledgerGroups||[{id:1,name:'MVU变量',frequency:1},{id:2,name:'只读变量',frequency:0}]};
+        for(const key of variableIds){
             const sheet=template[key];
+            if(!sheet)throw new Error('MVU变量表缺失：'+key);
             if(sheet.sourceData?.hiddenPhysicalColumns?.length)throw new Error('当前台账适配版暂不支持隐藏物理列，请保留原卡');
             for(const field of ['note','initNode','insertNode','updateNode','deleteNode'])if(/<%/.test(sheet.sourceData?.[field]||''))throw new Error('当前台账适配版暂不支持填表规则中的动态 EJS');
-            sheet.ledgerV2={tableId:key,name:sheet.name,orderNo:sheet.orderNo,groupId:sheet.updateConfig?.updateFrequency===0?2:1,
+            const groupId=sheet.ledgerV2?.groupId??(sheet.updateConfig?.updateFrequency===0?2:1);
+            const group=template.mate.ledgerGroups.find(g=>g.id===groupId);
+            if(!group)throw new Error('MVU变量表分组缺失：'+key);
+            sheet.ledgerV2={tableId:key,name:sheet.name,orderNo:sheet.orderNo,groupId,
                 note:[sheet.sourceData?.note,'【台账适配】按台账本次请求规定的操作格式更新；不要输出 SQL、MVU 更新块。JSON 单元格提交完整合法 JSON，保留未变化的键与原始类型。只记录已有依据的变化。'].filter(Boolean).join('\n'),
                 triggerNotes:{init:sheet.sourceData?.initNode||'',insert:sheet.sourceData?.insertNode||'',update:sheet.sourceData?.updateNode||'',delete:sheet.sourceData?.deleteNode||''},
                 columns:sheet.content[0].slice(1).map(header=>({header,type:'text',unique:false,notNull:false})),readMode:'all',worldbook:{enabled:false}};
             // No SQL-only row-window filters: every mapped variable is presented by the original MVU snapshot.
-            sheet.updateConfig={skipFloors:-1,updateFrequency:sheet.ledgerV2.groupId===2?0:1};
+            sheet.updateConfig={skipFloors:-1,updateFrequency:group.frequency};
         }
         return template;
     }
-    return {adapt};
+    return {adapt,merge};
 });
 (function(root){const createLibraries=function(){var module={exports:{}};var exports=module.exports;
 /*! For license information please see schema-engine-libs.js.LICENSE.txt */
@@ -12575,7 +12627,7 @@ root.__MVU2LEDGER_SETTINGS_VIEW__ = function settingsView(settings) {
         return [
             '<div class="inline-drawer">',
             '  <div class="inline-drawer-toggle inline-drawer-header">',
-            '    <b>MVU转台账</b>',
+            '    <b>MVU转台账 · 0.1.1</b>',
             '    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>',
             '  </div>',
             '  <div class="inline-drawer-content">',
@@ -12589,6 +12641,7 @@ root.__MVU2LEDGER_SETTINGS_VIEW__ = function settingsView(settings) {
             '      <div id="mvu2ledger-state-progress" class="mvu2ledger-hint" role="status" aria-live="polite"></div>',
             '      <div class="mvu2ledger-help">本测试版仅支持新聊天建表。旧聊天导入暂不开放；导出可作人工核对。</div>',
             '      <h3 class="mvu2ledger-section-title">转换角色卡</h3>',
+            '      <div class="mvu2ledger-help">使用小手机等依赖既有台账的功能时，请在转换后合并所需的原台账表，再保存新卡。0.1.1 保留原表分组与注入设置；重叠字段尚未自动同步，先用新聊天测试。</div>',
             '      <div class="mvu2ledger-row">',
             '        <span class="mvu2ledger-label">输入来源（二选一）</span>',
             '        <label><input type="radio" name="mvu2ledger-source" value="character" checked /> 酒馆角色卡</label>',
@@ -18000,7 +18053,7 @@ root.__MVU2LEDGER_EXTENSION_RUNTIME_INSTALLER__ = function installExtensionRunti
         if (!core || typeof core.convert !== 'function') {
             throw new Error('转换核心未加载（MVU2LEDGER_CORE 不可用）');
         }
-        const mode = 'sqlite';
+        const mode = 'native';
         const opts = {
             mode,
             targetSpVersion: await readTargetSpVersion(),
@@ -18202,15 +18255,21 @@ root.__MVU2LEDGER_EXTENSION_RUNTIME_INSTALLER__ = function installExtensionRunti
             toast('转换核心不可用', 'error');
             return;
         }
-        const manualPlan = conversionProfileTools.planManualMerge({
-            template: lastResult.template, sourceTemplate: mergeState.sourceTemplate, selected: checked,
-            source: mergeState.source, priorRefs: mergeState.appliedRefs,
-        });
+        let manualPlan;
+        try {
+            manualPlan = conversionProfileTools.planManualMerge({
+                template: lastResult.template, sourceTemplate: mergeState.sourceTemplate, selected: checked,
+                source: mergeState.source, priorRefs: mergeState.appliedRefs,
+            });
+        } catch (error) {
+            toast('合并失败：' + error.message, 'error');
+            return;
+        }
         const merged = manualPlan.merged;
         dbg(' applyMergeTables: 勾选=' + checked.join('、') + ' | 新增=' + merged.added.join('、') + ' | 跳过=' + merged.skipped.join('、') + ' | 合并后表数=' + Object.keys(merged.template).filter(k => k.startsWith('sheet_')).length);
         if (!merged.added.length) { toast('没有可并入的表（全部重名或无效）', 'error'); return; }
         const settings = getSettings();
-        const mode = 'sqlite';
+        const mode = 'native';
         const opts = {
             mode,
             template: merged.template,
@@ -18232,7 +18291,7 @@ root.__MVU2LEDGER_EXTENSION_RUNTIME_INSTALLER__ = function installExtensionRunti
             mergeState.appliedRefs = manualPlan.refs;
             renderResult(result);
             dbg(' applyMergeTables 产物更新完成: meta.tableCount=' + result.meta.tableCount + ' | tableNames=' + result.meta.tableNames.join('、'));
-            const msg = '合并完成：新增 ' + merged.added.length + ' 张表' + (merged.skipped.length ? '，跳过重名：' + merged.skipped.join('、') : '');
+            const msg = '合并完成：新增 ' + merged.added.length + ' 张表；已保留原台账分组和注入设置。重叠字段尚未自动同步，请先用新聊天测试。' + (merged.skipped.length ? '，跳过重名：' + merged.skipped.join('、') : '');
             if (status) status.textContent = msg;
             toast(msg, 'info');
             // 刷新勾选列表：已并入的表标记为“已存在”
@@ -25303,6 +25362,10 @@ root.__MVU2LEDGER_BRIDGE_LIFECYCLE_FACTORY__ = function createBridgeLifecycle(ho
      * 返回 { template, added, skipped }；重名表跳过（插件校验表名唯一），uid 冲突自动加后缀。
      */
     function mergeTemplates(base, source, selectedUids) {
+        if(base?.mate?.mvuLedger?.version===1){
+            const factory=typeof require==='function'?require('./ledger-template.js'):root.__MVU2LEDGER_LEDGER_TEMPLATE_FACTORY__;
+            return factory().merge(base,source,selectedUids);
+        }
         const merged = JSON.parse(JSON.stringify(base && typeof base === 'object' ? base : {}));
         if (!merged.mate) {
             merged.mate = {
@@ -25544,7 +25607,7 @@ root.__MVU2LEDGER_BRIDGE_LIFECYCLE_FACTORY__ = function createBridgeLifecycle(ho
             js: 'index.js',
             css: 'style.css',
             author: 'yuan-1992-png; based on wmdl2/mvu2shujuku contributors',
-            version: '0.1.0',
+            version: '0.1.1',
             homePage: 'https://github.com/yuan-1992-png/ST-Ledger-Cache-Layout/tree/mvu-ledger',
             auto_update: false,
             minimum_client_version: '1.12.0',

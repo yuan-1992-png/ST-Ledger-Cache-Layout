@@ -5,7 +5,7 @@ function settingsView(settings) {
         return [
             '<div class="inline-drawer">',
             '  <div class="inline-drawer-toggle inline-drawer-header">',
-            '    <b>MVU转台账</b>',
+            '    <b>MVU转台账 · 0.1.1</b>',
             '    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>',
             '  </div>',
             '  <div class="inline-drawer-content">',
@@ -19,6 +19,7 @@ function settingsView(settings) {
             '      <div id="mvu2ledger-state-progress" class="mvu2ledger-hint" role="status" aria-live="polite"></div>',
             '      <div class="mvu2ledger-help">本测试版仅支持新聊天建表。旧聊天导入暂不开放；导出可作人工核对。</div>',
             '      <h3 class="mvu2ledger-section-title">转换角色卡</h3>',
+            '      <div class="mvu2ledger-help">使用小手机等依赖既有台账的功能时，请在转换后合并所需的原台账表，再保存新卡。0.1.1 保留原表分组与注入设置；重叠字段尚未自动同步，先用新聊天测试。</div>',
             '      <div class="mvu2ledger-row">',
             '        <span class="mvu2ledger-label">输入来源（二选一）</span>',
             '        <label><input type="radio" name="mvu2ledger-source" value="character" checked /> 酒馆角色卡</label>',
