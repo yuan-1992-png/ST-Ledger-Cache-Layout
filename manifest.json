@@ -1,12 +1,14 @@
 {
-  "display_name": "台账填表缓存适配",
-  "loading_order": 150,
+  "display_name": "MVU转台账 · 测试版",
+  "loading_order": 300,
   "requires": [],
   "optional": [],
+  "dependencies": [],
   "js": "index.js",
   "css": "style.css",
-  "author": "yuan-1992-png",
-  "version": "0.2.1",
-  "homePage": "https://github.com/yuan-1992-png/ST-Ledger-Cache-Layout",
-  "auto_update": false
+  "author": "yuan-1992-png; based on wmdl2/mvu2shujuku contributors",
+  "version": "0.1.0",
+  "homePage": "https://github.com/yuan-1992-png/ST-Ledger-Cache-Layout/tree/mvu-ledger",
+  "auto_update": false,
+  "minimum_client_version": "1.12.0"
 }

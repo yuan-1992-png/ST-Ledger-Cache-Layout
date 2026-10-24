@@ -1,0 +1,40 @@
+{
+  "date": "2026-10-24",
+  "version": "0.1.0",
+  "ledger": "V1.147",
+  "unitTests": {
+    "passed": 18,
+    "failed": 0
+  },
+  "browser": {
+    "passed": true,
+    "checks": [
+      "isolated browser UI boots",
+      "old-state import disabled",
+      "SQL option disabled",
+      "conversion works in browser",
+      "separate converter namespace",
+      "no runtime errors"
+    ],
+    "hostFilesChanged": false
+  },
+  "realEngine": {
+    "realLedgerVersion": "V1.147",
+    "init": true,
+    "readWrite": true,
+    "reinitDoesNotReset": true,
+    "invalidWriteRejected": true,
+    "historyAcrossFloors": true,
+    "reloadPreservesData": true,
+    "existingPresetReusable": true,
+    "inMemoryPersistence": true,
+    "realChatFilesWritten": false
+  },
+  "limits": [
+    "Synthetic fixtures; no paid model calls",
+    "No user chat modified",
+    "No end-to-end AI accuracy evaluation",
+    "No full regression of phone or status-bar features"
+  ],
+  "upstreamCommit": "a1b792543caca1b8a171b7a222ffb4d46e81cdfe"
+}

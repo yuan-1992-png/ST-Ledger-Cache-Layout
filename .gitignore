@@ -1,10 +1,19 @@
+# 测试 fixture 是从参考卡提取的角色卡内容，不上传（缺失时相关测试自动跳过）
+test/fixtures/
+
+# 常规忽略
 node_modules/
-*.log
-*.zip
-private/
-local/
-request.json
-*.har
-settings.json
-test-results/
+.tools/
 .DS_Store
+*.log
+*.tgz
+DOCUMENTATION.md
+DOCUMENTATION_HISTORY.md
+
+# 本地审查与临时诊断报告
+docs/audits/
+# 本机环境与个人维护信息；公共开发资料放 docs/ 根目录
+docs/local/
+
+# 本地 Codex 指令，不提交到仓库
+AGENTS.md

@@ -1,0 +1,7065 @@
+'use strict';
+
+// ST 扩展运行时入口；通过 window 上的模块工厂和核心接口协作。
+function installExtensionRuntime(window) {
+    'use strict';
+    const root = window;
+    const stAdapter = window.__MVU2LEDGER_ST_ADAPTER_FACTORY__(window);
+
+    const PLUGIN_ID = 'mvu2ledger';
+    const PANEL_ID = PLUGIN_ID + '-settings';
+    const SETTINGS_KEY = 'mvu2ledger';
+    const state = { timer: null };
+
+    // debug 开关：读 window.__mvu2ledgerDebug（由设置面板/加载时写入）
+    function mvu2ledgerDebugOn() {
+        try {
+            const w = (typeof window !== 'undefined' ? window : globalThis);
+            return !!(w && w.__mvu2ledgerDebug);
+        } catch (e) { return false; }
+    }
+    function dbg() {
+        if (!mvu2ledgerDebugOn()) return;
+        try { console.log.apply(console, ['[mvu2ledger][debug]'].concat(Array.prototype.slice.call(arguments))); } catch (e) {}
+    }
+    function dbgWarn() {
+        if (!mvu2ledgerDebugOn()) return;
+        try { console.warn.apply(console, ['[mvu2ledger][debug]'].concat(Array.prototype.slice.call(arguments))); } catch (e) {}
+    }
+
+    // 开局建表核心流程（与卡内数据桥同一份逻辑：缺表时调用 SP·数据库 的 initGameSession）
+    const { mvu2ledgerDecodeB64, mvu2ledgerExpectedTableNames, mvu2ledgerSheetByName, mvu2ledgerHasExtraRows, mvu2ledgerTablesSafeToAnchor, mvu2ledgerMissingTableNames, mvu2ledgerExpectedColumns, mvu2ledgerMissingColumns, mvu2ledgerMacroMark, mvu2ledgerMacroEnv, mvu2ledgerMacroCacheKey, mvu2ledgerCheckRowKeyCollision, mvu2ledgerResolveTemplateMacros, mvu2ledgerHasFullFrame, mvu2ledgerChatHasFullCheckpoint, mvu2ledgerChatIsPristineOpening, mvu2ledgerForeignRuntimeTableNames, mvu2ledgerChatHasAiFloor, mvu2ledgerRuntimeChatKey, mvu2ledgerWithTimeout, mvu2ledgerEnsureInit } = window.__MVU2LEDGER_SP_ADAPTER_FACTORY__(window);
+
+    const DB_TEMPLATE_KEY = '__SL_MVU_TEMPLATE_DATA__';
+    const autoInitState = { running: false, done: '', inited: false, retries: 0, anchorChat: '', anchorTries: 0, apiRetries: 0 };
+    let autoInitNoEntryRetries = 0;
+
+    // 独有标记：本转换器产出的卡一定有 extensions.mvu2ledger.converter === 'mvu2ledger'。
+    // SP·数据库 的 __SL_MVU_TEMPLATE_DATA__ 世界书条目是通用模板条目（其他数据库卡也可能带），
+    // 不能作为“本转换器产物”的判据；所有运行时行为都以这个独有标记为门槛，确保不碰别的卡。
+    // ST 角色对象结构：extensions 在 data.extensions 下（顶层通常没有 extensions）；
+    // 读取时两种位置都兼容，避免“没核实对象结构”导致标记永远判不中。
+    function charExtensions(...args) { return stAdapter.charExtensions(...args); }
+
+    // 角色世界书：顶层或 data 下（ST 完整对象的世界书在 data.character_book）
+    function charWorldBook(...args) { return stAdapter.charWorldBook(...args); }
+
+    function characterDisplayName(...args) { return stAdapter.characterDisplayName(...args); }
+
+    function isConvertedMvuCard(character) {
+        try {
+            const ext = charExtensions(character);
+            const mk = ext && ext.mvu2ledger;
+            return !!(mk && mk.converter === 'mvu2ledger');
+        } catch (e) { return false; }
+    }
+    // 取当前卡的模板：优先用已缓存，否则从当前角色世界书 __SL_MVU_TEMPLATE_DATA__ 条目解析并缓存。
+    // 缓存归属键：卡名 + 头像。完整卡加载时保留列表对象的头像身份；
+    // 不能用同名兜底覆盖两个明确不同的角色。
+    function cardCacheKey(ch) {
+        try { return ch ? characterDisplayName(ch) + '|' + String(ch.avatar || (ch.data && ch.data.avatar) || '') : ''; } catch (e) { return ''; }
+    }
+
+    // 旧版缓存可能缺头像；只有身份缺失且名称唯一时才兼容，明确不同头像绝不互认。
+    function cardCacheKeyMatches(activeKey, ch) {
+        if (!activeKey || !ch) return false;
+        const curKey = cardCacheKey(ch);
+        if (activeKey === curKey) return true;
+        const split = key => {
+            const i = String(key).lastIndexOf('|');
+            return { name: String(key).slice(0, i), avatar: String(key).slice(i + 1) };
+        };
+        const a = split(activeKey), b = split(curKey);
+        if (!a.name || a.name !== b.name || (a.avatar && b.avatar)) return false;
+        const context = getContextSafe();
+        const matches = (Array.isArray(context.characters) ? context.characters : [])
+            .filter(c => characterDisplayName(c) === b.name);
+        return matches.length <= 1;
+    }
+
+    function layoutBelongsToCurrentCard(activeKey) {
+        try { return cardCacheKeyMatches(activeKey, currentCharacter()); }
+        catch (e) { return false; }
+    }
+
+    // 切卡隔离：插件运行时（currentJsonTableData）在聊天切换后是异步 reload 的，
+    // 空窗期内 exportTableAsJson 可能仍返回上一张卡的表格。这里检查运行时表名集合：
+    // 任何既不在当前布局、也不在当前卡模板里的表，都视为跨卡残留（如切到催眠APP后
+    // 运行时还挂着道渊的世界表/主角表）。返回残留表名列表（空 = 无跨卡残留）。
+    function runtimeForeignTableNames(api, layoutEntries) {
+        try {
+            if (!api || typeof api.exportTableAsJson !== 'function') return ['<api未就绪>'];
+            const cur = api.exportTableAsJson() || {};
+            const runtimeNames = new Set();
+            for (const k in cur) {
+                if (k.indexOf('sheet_') === 0 && cur[k] && cur[k].name) runtimeNames.add(String(cur[k].name));
+            }
+            if (!runtimeNames.size) return [];
+            const expected = new Set((Array.isArray(layoutEntries) ? layoutEntries : []).map(L => String(L.table)));
+            const tpl = cachedTemplateForCurrentCard();
+            const tplNames = new Set();
+            if (tpl && typeof tpl === 'object') {
+                for (const k in tpl) {
+                    if (k.indexOf('sheet_') === 0 && tpl[k] && tpl[k].name) tplNames.add(String(tpl[k].name));
+                }
+            }
+            const foreign = [];
+            for (const n of runtimeNames) {
+                if (!expected.has(n) && !tplNames.has(n)) foreign.push(n);
+            }
+            return foreign;
+        } catch (e) { return ['<校验异常>']; }
+    }
+
+    function cachedTemplateForCurrentCard() {
+        try {
+            const holder = (typeof window !== 'undefined' ? window : globalThis);
+            // 缓存必须按卡归属：直接复用可能把上一张转换卡的模板套到当前卡上
+            // （如切卡后重锚/写库误用旧模板，污染当前聊天的表格结构）。
+            const ch = currentCharacter();
+            if (holder && holder.__mvu2ledgerTemplateCache &&
+                cardCacheKeyMatches(holder.__mvu2ledgerTemplateCacheFor, ch)) {
+                return holder.__mvu2ledgerTemplateCache;
+            }
+        } catch (e) {}
+        try {
+            const ch = currentCharacter();
+            if (!isConvertedMvuCard(ch)) return null;
+            const cb = ch && (ch.character_book || (ch.data && ch.data.character_book));
+            const entries = (cb && Array.isArray(cb.entries)) ? cb.entries : [];
+            const entry = entries.find(e => Array.isArray(e.keys) && e.keys.indexOf(DB_TEMPLATE_KEY) !== -1);
+            if (entry && entry.content) {
+                const parsed = JSON.parse(mvu2ledgerDecodeB64(entry.content));
+                try {
+                    const holder = (typeof window !== 'undefined' ? window : globalThis);
+                    if (holder) {
+                        holder.__mvu2ledgerTemplateCache = parsed;
+                        holder.__mvu2ledgerTemplateCacheFor = cardCacheKey(ch);
+                        holder.__mvu2ledgerTemplateCacheForName = String(ch.name || '');
+                    }
+                } catch (e2) {}
+                return parsed;
+            }
+        } catch (e) {}
+        return null;
+    }
+    function autoInitChatId() {
+        try {
+            const context = getContextSafe();
+            return String(context.chatId || context.chat_id || context.chatFile || context.chatFileName || 'unknown');
+        } catch (e) { return 'unknown'; }
+    }
+
+    // 每次进入会话有独立代次。A → B → A 也不能复活第一次 A 的异步任务。
+    // 不用聊天对象引用：首楼替换/回放可能更换数组但仍属于同一会话。
+    const runtimeSessions = window.__MVU2LEDGER_RUNTIME_SESSION_FACTORY__(() => {
+        const context = getContextSafe();
+        const ch = currentCharacter();
+        const avatar = ch && (ch.avatar || (ch.data && ch.data.avatar));
+        const characterKey = avatar ? 'avatar:' + avatar
+            : context.characterId != null ? 'id:' + context.characterId : 'name:' + characterDisplayName(ch);
+        return { characterKey, groupKey: context.groupId == null ? '' : context.groupId,
+            chatKey: autoInitChatId(), cardKey: cardCacheKey(ch) };
+    });
+    function captureRuntimeSession(validate) { return runtimeSessions.capture(validate); }
+    function bindWriteTarget(session) { return runtimeSessions.bindWriteTarget(session, () => getContextSafe().chat); }
+    const nativeStatStorage = window.__MVU2LEDGER_STAT_STORAGE_FACTORY__({
+        readLayout: () => activeLayout || [],
+        readPolicy: () => readCardApiMetadata().statStorage || {},
+        enabled: () => readCardApiMetadata().statStorage?.version >= 1,
+        readChat: () => getContextSafe().chat || [],
+        bindSession: bindWriteTarget, assertCurrent: assertRuntimeSession,
+    });
+    function isRuntimeSessionCurrent(session) { return runtimeSessions.isCurrent(session); }
+    function runtimeScopedChatKey(chatKey) { return runtimeSessions.scopedChatKey(chatKey); }
+    function assertRuntimeSession(session) { return runtimeSessions.assertCurrent(session); }
+    function runtimeApiForSession(api, session) { return runtimeSessions.apiForSession(api, session); }
+    let runtimeWindows = null;
+    let windowMvuLoadSyncPending = false;
+    function getRuntimeWindows() {
+        // 宿主窗口在安装器后段确定；首次使用时再建立观察器。
+        if (!runtimeWindows) runtimeWindows = window.__MVU2LEDGER_RUNTIME_WINDOWS_FACTORY__({
+            readRoots: () => {
+                const roots = [window, hostWindow];
+                try { roots.push(window.parent, window.top); } catch (_) {}
+                return [...new Set(roots.filter(Boolean))];
+            },
+            readSessionKey: () => { const session = captureRuntimeSession(); return session.key + ':' + session.epoch; },
+            MutationObserver: hostWindow.MutationObserver || window.MutationObserver,
+            onChange: () => {
+                if (windowMvuLoadSyncPending || !windowMvuShimTimer) return;
+                windowMvuLoadSyncPending = true;
+                const session = captureRuntimeSession();
+                hostWindow.setTimeout(() => {
+                    windowMvuLoadSyncPending = false;
+                    if (windowMvuShimTimer && isRuntimeSessionCurrent(session)) {
+                        try { applyWindowMvuShim(); } catch (_) {}
+                    }
+                }, 0);
+            },
+        });
+        return runtimeWindows.getWindows();
+    }
+
+    // 首楼替换修复：原版道渊“重塑仙缘”等机制用 setChatMessages 替换第零层，会把
+    // TavernDB_ACU_ScopedConfig / InternalSheetGuide 从首楼消息上抹掉；插件随后读不到
+    // 模板作用域，就按 legacy 迁移冻结成“旧版聊天冻结模板”（催眠APP没有首楼替换所以正常）。
+    // 参考卡（道渊-开局收尾桥）在替换时快照/拷回这些字段；转换卡没有，这里在重进/切聊天/
+    // 首楼更新后做幂等修复（仅转换卡）：
+    //   1) 首楼缺插件字段 → 从 chat_metadata 权威副本拷回；
+    //   2) 模板作用域被冻结（presetName 为旧版标签）→ 恢复为当前卡模板名（templateStr 内容不变）；
+    // 注意：绝不用转换器自己的模板重建 ScopedConfig——转换器模板是紧凑拼音 key（sheet_shijiebiao），
+    // 插件作用域/聊天数据是插件规范化 key（sheet_shi_jie_biao），混写会造成 V2 重放
+    // “物理表名冲突”并显示“当前生效模板与预设库内容不同”。作用域缺失时交给插件自己迁移。
+    function repairChatTemplateScope() {
+        try {
+            if (!activeLayout) return; // 只处理转换卡
+            const context = getContextSafe();
+            const chat = Array.isArray(context.chat) ? context.chat : [];
+            if (!chat.length || !chat[0] || typeof chat[0] !== 'object') return;
+            const first = chat[0];
+            const metadata = (context.chat_metadata && typeof context.chat_metadata === 'object') ? context.chat_metadata : null;
+            let changed = false;
+            // 1) 消息级字段丢失 → 从 chat_metadata 拷回
+            if (metadata) {
+                for (const field of ['TavernDB_ACU_InternalSheetGuide', 'TavernDB_ACU_ScopedConfig']) {
+                    if (first[field] === undefined && metadata[field] !== undefined) {
+                        try { first[field] = JSON.parse(JSON.stringify(metadata[field])); changed = true; } catch (e) {}
+                    }
+                }
+            }
+            // 2) 作用域被冻结 → 恢复模板名
+            let sc = first.TavernDB_ACU_ScopedConfig;
+            if (typeof sc === 'string') { try { sc = JSON.parse(sc); } catch (e) { sc = null; } }
+            if (sc && sc.template && typeof sc.template === 'object' && !Array.isArray(sc.template)) {
+                const ch = currentCharacter();
+                const cardName = characterDisplayName(ch);
+                const properName = cardName ? cardName + '模板' : '';
+                let nameChanged = false;
+                for (const k of Object.keys(sc.template)) {
+                    const st = sc.template[k];
+                    if (!st || typeof st !== 'object') continue;
+                    const pn = String(st.presetName || '');
+                    // “模板”是早期自动建表在角色上下文尚未就绪时生成的缺名标签。
+                    // 只在无歧义的缺名/旧版标签上自动更名，不触碰用户自定义模板名。
+                    const missingName = pn.trim() === '模板';
+                    if ((pn.indexOf('旧版') === 0 || missingName) && properName && pn !== properName) {
+                        st.presetName = properName;
+                        if (typeof st.source === 'string' && st.source.indexOf('legacy') === 0) st.source = 'ui';
+                        st.updatedAt = Date.now();
+                        nameChanged = true;
+                    }
+                }
+                if (nameChanged) { changed = true; first.TavernDB_ACU_ScopedConfig = sc; }
+            }
+            // 同步 chat_metadata（插件以 metadata 为权威源），并落盘
+            if (changed) {
+                if (metadata) {
+                    try {
+                        for (const field of ['TavernDB_ACU_InternalSheetGuide', 'TavernDB_ACU_ScopedConfig']) {
+                            if (first[field] !== undefined) metadata[field] = JSON.parse(JSON.stringify(first[field]));
+                        }
+                    } catch (e) {}
+                    try {
+                        const updater = (typeof context.updateChatMetadata === 'function' && context.updateChatMetadata.bind(context)) ||
+                            (typeof window.updateChatMetadata === 'function' ? window.updateChatMetadata.bind(window) : null);
+                        if (updater) updater({
+                            TavernDB_ACU_ScopedConfig: metadata.TavernDB_ACU_ScopedConfig,
+                            TavernDB_ACU_InternalSheetGuide: metadata.TavernDB_ACU_InternalSheetGuide,
+                        }, false);
+                    } catch (e) {}
+                }
+                const saveFn = (typeof context.saveChatConditional === 'function' && context.saveChatConditional.bind(context)) ||
+                    (typeof context.saveChat === 'function' && context.saveChat.bind(context)) ||
+                    (typeof window.saveChatConditional === 'function' ? window.saveChatConditional.bind(window) : null) ||
+                    (typeof window.saveChat === 'function' ? window.saveChat.bind(window) : null);
+                if (saveFn) { Promise.resolve(saveFn()); dbg(' [模板作用域修复] 已恢复首楼插件字段/模板名。'); }
+            }
+        } catch (e) {}
+    }
+
+    // 开场持久化连续性：有些卡会在捏人完成后删除/替换首楼，
+    // 而 SP·数据库的 full checkpoint 正挂在该消息上。消息与帧一起被删后，
+    // 仅修复 ScopedConfig/Guide 无法找回用户刚填的数据。这里只在“本次会话
+    // 新建 checkpoint + 开场短窗口”内记住最后落定快照；若持久化载体真的
+    // 消失，使用插件公开 initGameSession 在存活楼层建新锚，再经正常 CRUD 恢复。
+    // 不复制 TavernDB_ACU_IsolatedData 原始帧，避免携带旧楼层序号/旧日志。
+    const openingContinuityByChat = Object.create(null);
+    function openingContinuityState(chatKey) {
+        const key = runtimeScopedChatKey(chatKey);
+        if (!openingContinuityByChat[key]) {
+            openingContinuityByChat[key] = { armed: false, snapshot: null, expiresAt: 0, recovering: false, attempts: 0, recoveries: 0 };
+        }
+        return openingContinuityByChat[key];
+    }
+    // 保留有效的开场保护，不按数量淘汰；过期/已解除状态由现有轮询回收。
+    // 恢复中的异步任务仍使用同一 state，必须等它结束后才能移除。
+    function pruneOpeningContinuityStates() {
+        const now = Date.now();
+        for (const key of Object.keys(openingContinuityByChat)) {
+            const st = openingContinuityByChat[key];
+            if (st.recovering || (st.armed && st.snapshot && now <= st.expiresAt)) continue;
+            st.armed = false;
+            st.snapshot = null;
+            delete openingContinuityByChat[key];
+        }
+    }
+    function openingChatIsShort() {
+        try {
+            const ctx = getContextSafe();
+            const chat = Array.isArray(ctx.chat) ? ctx.chat : [];
+            return chat.length > 0 && chat.length <= 3;
+        } catch (e) { return false; }
+    }
+    function cloneOpeningStat(stat) {
+        try {
+            const copy = JSON.parse(JSON.stringify(stat || {}));
+            if (copy && typeof copy === 'object') delete copy.$internal;
+            return copy;
+        } catch (e) { return null; }
+    }
+    function armOpeningContinuity(chatKey, stat) {
+        if (!openingChatIsShort()) return;
+        const snapshot = cloneOpeningStat(stat);
+        if (!snapshot) return;
+        const st = openingContinuityState(chatKey);
+        st.armed = true;
+        st.snapshot = snapshot;
+        st.expiresAt = Date.now() + 30 * 60 * 1000;
+        st.attempts = 0;
+        st.recoveries = 0;
+        startGreetingInitvarPoll();
+        dbg('[开场连续性] 已记录新建 checkpoint 的最新数据快照。');
+    }
+    function refreshOpeningContinuityAfterWrite(chatKey, stat) {
+        const st = openingContinuityState(chatKey);
+        if (!st.armed || Date.now() > st.expiresAt || !openingChatIsShort()) return;
+        const snapshot = cloneOpeningStat(stat);
+        if (snapshot) {
+            st.snapshot = snapshot;
+            st.expiresAt = Date.now() + 30 * 60 * 1000;
+            dbg('[开场连续性] 已按本次提交更新恢复快照。');
+        }
+    }
+    async function recoverOpeningContinuity(reason) {
+        const session = captureRuntimeSession();
+        const chatKey = autoInitChatId();
+        const st = openingContinuityState(chatKey);
+        // 卡内桥可能先于扩展完成 initGameSession + replaceMvuData，随后原卡立刻 /cut
+        // 首楼。此时扩展在 autoInitDatabase 的单次检查中还没来得及 armed，等收到
+        // MESSAGE_DELETED 时 checkpoint 已经消失。恢复入口必须能够“迟到接管”桥留下的
+        // fresh 标记与候选快照，不能要求 st 事先已 armed。
+        try {
+            const freshMark = hostWindow.__mvu2ledgerFreshOpeningCheckpoint;
+            const candidate = hostWindow.__mvu2ledgerOpeningStatCandidate;
+            const freshMatches = !!(freshMark && freshMark.chatKey === chatKey &&
+                Date.now() - Number(freshMark.at || 0) < 30 * 60 * 1000);
+            const candidateMatches = !!(candidate && candidate.chatKey === chatKey &&
+                Date.now() - Number(candidate.at || 0) < 30 * 60 * 1000);
+            if (!st.armed && freshMatches && candidateMatches && openingChatIsShort()) {
+                const lateSnapshot = cloneOpeningStat(candidate.stat);
+                if (lateSnapshot) {
+                    armOpeningContinuity(chatKey, lateSnapshot);
+                    hostWindow.__mvu2ledgerFreshOpeningCheckpoint = null;
+                    dbg('[开场连续性] 已迟到接管卡内桥的新建 checkpoint 快照。');
+                }
+            }
+            if (st.armed && candidate && candidate.chatKey === chatKey && Date.now() - Number(candidate.at || 0) < 30 * 60 * 1000) {
+                const adopted = cloneOpeningStat(candidate.stat);
+                if (adopted) st.snapshot = adopted;
+            }
+        } catch (e) {}
+        if (!st.armed || st.recovering || !st.snapshot) return;
+        if (Date.now() > st.expiresAt || !openingChatIsShort()) { st.armed = false; st.snapshot = null; return; }
+        if (!activeLayout || !layoutBelongsToCurrentCard(activeLayoutCardKey)) return;
+        // 仍有 full checkpoint，或持久化回放仍能重建出数据，都不应重建。
+        if (mvu2ledgerChatHasFullCheckpoint()) return;
+        try { if (readPersistedTableData()) return; } catch (e) {}
+        const ctx = getContextSafe();
+        const chat = Array.isArray(ctx.chat) ? ctx.chat : [];
+        if (!chat.some(m => m && !m.is_user)) {
+            if (st.attempts++ < 8) hostWindow.setTimeout(() => recoverOpeningContinuity(reason), 350);
+            return;
+        }
+        const api = runtimeApiForSession(getAcuApi(), session);
+        const tpl = cachedTemplateForCurrentCard();
+        if (!api || typeof api.initGameSession !== 'function' || !tpl) {
+            if (st.attempts++ < 8) hostWindow.setTimeout(() => recoverOpeningContinuity(reason), 500);
+            return;
+        }
+        st.recovering = true;
+        st.attempts += 1;
+        const snapshot = cloneOpeningStat(st.snapshot);
+        try {
+            dbg('[开场连续性] 检测到 checkpoint 载体消失（' + String(reason || '消息变更') + '），正在存活楼层重建。');
+            const ch = currentCharacter();
+            const presetName = (characterDisplayName(ch) || '角色') + '模板';
+            const initOut = await Promise.resolve(api.initGameSession({}, {
+                injectTemplate: true,
+                loadPreset: false,
+                templateData: tpl,
+                templatePresetName: presetName,
+            }));
+            if (initOut && initOut.success === false) throw new Error(initOut.message || 'initGameSession 失败');
+            const ready = await waitRuntimeTablesReady(api, activeLayout, 5000);
+            assertRuntimeSession(session);
+            if (!ready) throw new Error('数据库运行时未就绪');
+            overlayFlushRetries = 0;
+            // This is a committed snapshot, not a new model candidate. MVU's
+            // replaceMvuData restores values without executing Schema again;
+            // transforms/default providers must not run a second time here.
+            const restoreSession = { ...session, rawAuthorWrite: true };
+            const ok = await scheduleWindowStatOverlay(snapshot, null, false, false, chatKey, restoreSession);
+            assertRuntimeSession(session);
+            if (!ok) throw new Error('开场数据重写未落定');
+            st.recoveries += 1;
+            st.attempts = 0;
+            // 开场可能先 setChatMessage 切到捏人页，最后又 /cut 掉捏人楼。
+            // 因此一次恢复后继续保护，直到首次生成结束/超时；最多恢复 3 次。
+            if (st.recoveries >= 3) { st.armed = false; st.snapshot = null; }
+            dbg('[开场连续性] 已在存活楼层建立新 checkpoint 并恢复开场数据。');
+        } catch (e) {
+            if (!isRuntimeSessionCurrent(session)) return;
+            dbgWarn('[开场连续性] 恢复失败，等待重试:', e && e.message ? e.message : e);
+            if (st.attempts < 8) hostWindow.setTimeout(() => recoverOpeningContinuity(reason), 700);
+        } finally {
+            st.recovering = false;
+        }
+    }
+    function scheduleOpeningContinuityRecovery(reason) {
+        hostWindow.setTimeout(() => { recoverOpeningContinuity(reason); }, 80);
+        hostWindow.setTimeout(() => { recoverOpeningContinuity(reason); }, 450);
+    }
+    function disarmOpeningContinuity(chatKey) {
+        const key = runtimeScopedChatKey(chatKey);
+        const st = openingContinuityByChat[key];
+        if (!st) return;
+        if (st.recovering) {
+            hostWindow.setTimeout(() => disarmOpeningContinuity(chatKey), 1000);
+            return;
+        }
+        st.armed = false;
+        st.snapshot = null;
+        delete openingContinuityByChat[key];
+    }
+
+    // 对应 MVU 的 init 时机：进入聊天/收到首条消息时，若卡内有模板且表格缺失则自动建表。
+    // 只处理本转换器产出的卡（extensions.mvu2ledger 标记 + 世界书 __SL_MVU_TEMPLATE_DATA__ 模板），
+    // 其余卡一律不动（别的数据库卡也可能带 __SL_MVU_TEMPLATE_DATA__，但不会有我们的独有标记）。
+    async function autoInitDatabase() {
+        const session = captureRuntimeSession();
+        const key0 = autoInitChatId();
+        if (autoInitState.running) {
+            dbg(' 开局自动建表跳过：上一轮仍在运行（chat=' + key0 + '）');
+            return;
+        }
+        const api = runtimeApiForSession(getAcuApi(), session);
+        if (!api) {
+            dbg(' 开局自动建表跳过：未找到 瑟瑟台账 API（chat=' + key0 + '）');
+            // 插件可能晚于聊天加载就绪：API 缺失时轮询重试，确保锚点在用户操作前建立
+            if (autoInitState.apiRetries < 12) {
+                autoInitState.apiRetries += 1;
+                hostWindow.setTimeout(autoInitDatabase, 2000);
+            }
+            return;
+        }
+        let character = null;
+        try { character = currentCharacter(); } catch (e) {}
+        if (!character) {
+            dbg(' 开局自动建表跳过：当前角色为空（chat=' + key0 + '）');
+            return;
+        }
+        // “完整卡”判定：有世界书（顶层或 data 下）才算完整数据；角色列表懒加载对象
+        // 只有 data.extensions{fav,world} 等元数据，不能据此跳过取完整卡。
+        const charHasFullData = !!(character && (character.character_book || (character.data && character.data.character_book)));
+        if (!isConvertedMvuCard(character)) {
+            // 角色列表懒加载时可能只有元数据、缺 extensions：先尝试取完整卡再判断一次；
+            // 仍无独有标记说明不是本转换器产物，直接跳过，不碰任何其他卡。
+            // 对象已带 extensions 且无标记 = 完整卡且非转换产物，直接跳过，不再发请求。
+            try {
+                if (!charHasFullData) {
+                    const full = await fetchFullCharacter(character, true);
+                    if (!isRuntimeSessionCurrent(session)) return;
+                    if (full && isConvertedMvuCard(full)) {
+                        character = full;
+                    } else if (full === null) {
+                        // 获取完整卡失败（接口返回异常对象/网络问题），不能判定为非转换卡：
+                        // 保留运行时状态并重试，避免把本转换器产物误判成普通卡而跳过建表。
+                        dbg(' 开局自动建表：获取完整卡失败，稍后重试（chat=' + key0 + '）');
+                        if (autoInitNoEntryRetries < 8) {
+                            autoInitNoEntryRetries += 1;
+                            hostWindow.setTimeout(autoInitDatabase, 3000);
+                        }
+                        return;
+                    }
+                }
+                if (!isConvertedMvuCard(character)) {
+                    dbg(' 开局自动建表跳过：当前卡无本转换器标记 extensions.mvu2ledger（chat=' + key0 + '），不影响其他卡');
+                    // 清掉上一张转换卡残留的运行时状态，确保切到其他卡后不再接管/广播
+                    activeLayout = null;
+                    activeLayoutCardKey = '';
+                    activePlaceholderNeeded = false;
+                    restoreWindowMvuShim();
+                    restoreWindowGetAllVariables();
+                    return;
+                }
+            } catch (e) {
+                if (!isRuntimeSessionCurrent(session)) return;
+                dbg(' 开局自动建表跳过：读取当前卡标记失败（chat=' + key0 + '）');
+                activeLayout = null;
+                activeLayoutCardKey = '';
+                activePlaceholderNeeded = false;
+                restoreWindowMvuShim();
+                restoreWindowGetAllVariables();
+                return;
+            }
+        }
+        let hadWorldbook = true;
+        const cb = charWorldBook(character);
+        if (!(cb && Array.isArray(cb.entries) && cb.entries.length)) {
+            hadWorldbook = false;
+            dbg(' 角色列表对象缺世界书，尝试 /api/characters/get 取完整卡（chat=' + key0 + '）');
+            try {
+                const full = await fetchFullCharacter(character);
+                if (!isRuntimeSessionCurrent(session)) return;
+                if (full && full.character_book && Array.isArray(full.character_book.entries) && full.character_book.entries.length) {
+                    character = full;
+                    hadWorldbook = true;
+                } else {
+                    dbgWarn(' /api/characters/get 未能取回世界书（chat=' + key0 + '）');
+                }
+            } catch (e) {
+                dbgWarn(' /api/characters/get 异常：' + (e && e.message ? e.message : e) + '（chat=' + key0 + '）');
+            }
+            // 完整卡获取失败（含接口返回异常对象）且当前对象无世界书时，稍后重试，
+            // 避免“新聊天没有初始化数据/表格为空”的误判。
+            if (!(character && charWorldBook(character) && Array.isArray(charWorldBook(character).entries) && charWorldBook(character).entries.length) &&
+                autoInitNoEntryRetries < 8) {
+                dbg(' 开局自动建表：完整卡获取失败，稍后重试（chat=' + key0 + '）');
+                autoInitNoEntryRetries += 1;
+                hostWindow.setTimeout(autoInitDatabase, 3000);
+                return;
+            }
+        }
+        if (!isRuntimeSessionCurrent(session)) return;
+        const fullCb = charWorldBook(character);
+        const entries = fullCb && Array.isArray(fullCb.entries) ? fullCb.entries : [];
+        const entry = entries.find(e => Array.isArray(e.keys) && e.keys.indexOf(DB_TEMPLATE_KEY) !== -1);
+        if (!entry || !entry.content) {
+            dbgWarn(' 未找到 __SL_MVU_TEMPLATE_DATA__ 世界书条目（entries=' + entries.length + '；chat=' + key0 + '）');
+            if (!hadWorldbook && autoInitNoEntryRetries < 8) {
+                // 懒加载角色列表可能晚于首次触发；轮询重试（4s），最多约 40s
+                autoInitNoEntryRetries += 1;
+                hostWindow.setTimeout(autoInitDatabase, 4000);
+            }
+            return;
+        }
+        autoInitNoEntryRetries = 0;
+        // 调试：确认当前卡的 tavern_helper 里到底有没有数据桥
+        try {
+            const dbgExt = charExtensions(character);
+            const th = dbgExt && dbgExt.tavern_helper;
+            const scripts = (th && Array.isArray(th.scripts) ? th.scripts : []).map(s => s.name + '(enabled=' + s.enabled + ')');
+            dbg(' 当前卡 tavern_helper.scripts =', JSON.stringify(scripts), '| 桥内容长度=' + (th && Array.isArray(th.scripts) && th.scripts.find(s => /数据桥/.test(String(s.name || ''))) ? String((th.scripts.find(s => /数据桥/.test(String(s.name || ''))).content || '')).length : 0));
+        } catch (e) {
+            dbgWarn(' 读取 tavern_helper 失败:', e);
+        }
+        // 缓存当前卡布局，供 EJS 数据读取（window.getAllVariables）
+        try {
+            const layoutExt = charExtensions(character);
+            const mk = layoutExt && layoutExt.mvu2ledger;
+            if (mk && typeof mk.layout === 'string') {
+                activeLayout = resolveRuntimeLayout(mk.layout);
+                activeCardApiMetadata = mk;
+                // 记录布局归属卡：用“读取时会看到的角色对象”（列表对象，带真实头像）
+                let layoutChar = null;
+                try { layoutChar = currentCharacter(); } catch (e) {}
+                activeLayoutCardKey = cardCacheKey(layoutChar);
+                dbg(' 已缓存当前卡布局，条目数=' + (Array.isArray(activeLayout) ? activeLayout.length : 0));
+            }
+        } catch (e) {
+            dbgWarn(' 解析卡布局失败:', e);
+        }
+        activePlaceholderNeeded = detectPlaceholderFor(character);
+        dbg('[占位符] 当前卡依赖状态栏占位符=' + activePlaceholderNeeded);
+        installWindowGetAllVariables();
+        const key = autoInitChatId();
+        if (!isRuntimeSessionCurrent(session)) return;
+        if (autoInitState.apiRetries > 0 && autoInitState.anchorChat !== key) autoInitState.apiRetries = 0;
+        // 缓存卡内模板（供写路径补行与锚点重建使用）
+        try {
+            const holder = (typeof window !== 'undefined' ? window : globalThis);
+            if (holder) holder.__mvu2ledgerTemplateCache = JSON.parse(mvu2ledgerDecodeB64(entry.content));
+            // 归属键用“读取时会看到的角色对象”（列表对象）而不是完整卡 data——
+            // full.data 的 avatar 为空，若用它做键，写入时 currentCharacter() 的
+            // name|avatar 永远对不上，模板缓存形同虚设，所有写库都会被“无模板缓存”拦掉。
+            let cacheChar = null;
+            try { cacheChar = currentCharacter(); } catch (e) {}
+            if (holder) holder.__mvu2ledgerTemplateCacheFor = cardCacheKey(cacheChar);
+            if (holder) holder.__mvu2ledgerTemplateCacheForName = cacheChar ? String(cacheChar.name || '') : '';
+        } catch (e) {}
+        // 首楼替换（道渊重塑仙缘等）会把插件作用域字段从首楼抹掉，导致插件按 legacy 冻结模板；
+        // 每次进入/切回聊天都做一次幂等修复（拷回/改名/重建）。
+        repairChatTemplateScope();
+        // 对齐参考卡：每个聊天只在“缺表”时初始化一次（下方 ensureInit），
+        // 已有表格的聊天绝不重初始化，避免切聊天时误重置别的聊天。
+        // 锚点/持久化由插件自己的 initGameSession 与提交管线维护，扩展不做手工锚定。
+        if (autoInitState.done === key && autoInitState.doneSession === session.key) return;
+        autoInitState.running = true;
+        autoInitState.session = session;
+        // 看门狗：即使插件 API 的 Promise 意外不返回，也强制复位 running，避免后续自动建表被永久跳过
+        const initWatchdog = hostWindow.setTimeout(() => {
+            if (autoInitState.running && autoInitState.session === session) {
+                autoInitState.running = false;
+                console.warn('[mvu2ledger] 开局自动建表看门狗触发：超过 30s 未完成，已复位（下次触发会重试）。');
+            }
+        }, 30000);
+        try {
+            const presetName = (characterDisplayName(character) || '角色') + '模板';
+            // 在 ensureInit 前记录：“本次进入前就已有存档”与“本次新建的 checkpoint”
+            // 语义不同。前者只能建立分支指纹基线，不能重放开局 initvar。
+            const hadFullCheckpointBeforeInit = mvu2ledgerChatHasFullCheckpoint();
+            // 新聊天必须把当前开场分支的 initvar / UpdateVariable / JSONPatch 合并进
+            // 首次 initGameSession。若先导入基础模板、再用第二次 initGameSession 覆盖，
+            // SP 会走 reloadCurrentChatUnsafe：页面像手动刷新前端一样重载，且第二份状态
+            // 可能在 SQLite 运行时重建期间丢失。
+            let preparedOpening = null;
+            if (!hadFullCheckpointBeforeInit) {
+                try {
+                    let baseTemplate = JSON.parse(mvu2ledgerDecodeB64(entry.content));
+                    const macroResult = mvu2ledgerResolveTemplateMacros(baseTemplate, entry.content);
+                    if (macroResult && macroResult.ok) {
+                        baseTemplate = macroResult.template;
+                        const core = window.MVU2LEDGER_CORE;
+                        if (core && typeof core.statDataFromTables === 'function') {
+                            const baseAll = core.statDataFromTables(activeLayout, baseTemplate);
+                            const source = activeGreetingSourceSnapshot();
+                            if (source) guardGreetingSource(session, source);
+                            const opening = await computeActiveGreetingSnapshot(baseAll, source,
+                                { deferSchema: !!(readCardApiMetadata().schemaKeys || []).length });
+                            if (!isRuntimeSessionCurrent(session)) return;
+                            if (opening) {
+                                const finalStat = opening.finalWrap && opening.finalWrap.stat_data
+                                    ? opening.finalWrap.stat_data
+                                    : opening.baseStat;
+                                const mergedTemplate = await buildUpdatedTemplateFromStat(
+                                    activeLayout,
+                                    opening.baseStat,
+                                    finalStat,
+                                    baseTemplate,
+                                );
+                                if (!isRuntimeSessionCurrent(session)) return;
+                                if (mergedTemplate && typeof mergedTemplate === 'object') {
+                                    preparedOpening = { opening, template: mergedTemplate };
+                                    dbg('[开场分支] 已将当前分支的初始化/更新块合并到首次 initGameSession。');
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    dbgWarn(' 合并当前开场分支到首次初始化失败，将等待后续兼容路径重试:', e);
+                }
+            }
+            if (!isRuntimeSessionCurrent(session)) return;
+            const out = await mvu2ledgerEnsureInit(
+                api,
+                entry.content,
+                presetName,
+                preparedOpening ? { preparedTemplate: preparedOpening.template } : undefined,
+            );
+            if (!isRuntimeSessionCurrent(session)) return;
+            // 新聊天里的异卡 checkpoint 虽然在调用前“存在”，但已由 ensureInit
+            // 安全替换为当前卡模板；后续必须按新初始化处理，不能把首楼更新块登记成历史基线。
+            const hadHistoricalCheckpointBeforeInit = hadFullCheckpointBeforeInit &&
+                !(out && out.replacedFreshForeignCheckpoint);
+            // 后续补行/差异写入也必须使用已解析模板，不能再从原始 base64
+            // 缓存取回字面量 <user>。
+            if (out && out.template) {
+                try {
+                    const holder = (typeof window !== 'undefined' ? window : globalThis);
+                    if (holder) holder.__mvu2ledgerTemplateCache = out.template;
+                } catch (e) {}
+            }
+            if (out.status === 'error' || out.status === 'partial') {
+                console.warn('[mvu2ledger] 开局自动建表未完全成功：' + out.message);
+                autoInitState.done = '';
+                // 开场白切换/重渲染可能打断插件初始化；轮询重试直到建表成功（最多约 1 分钟）。
+                // 但“表结构不匹配（旧模板）”重导失败时不风暴重试，避免反复执行重型 initGameSession 卡住界面；
+                // 下次进入聊天/收到消息时会再尝试一次。
+                autoInitState.retries += 1;
+                const structureMismatch = String(out.message).indexOf('结构不匹配') !== -1;
+                if (!structureMismatch && autoInitState.retries < 15) hostWindow.setTimeout(autoInitDatabase, 4000);
+            } else {
+                console.log('[mvu2ledger] 开局自动建表：' + out.message);
+                autoInitState.retries = 0;
+                autoInitState.done = key;
+                autoInitState.doneSession = session.key;
+                const greetingState = greetingInitState(key);
+                greetingState.ready = true;
+                if (preparedOpening && preparedOpening.opening && !preparedOpening.opening.schemaDeferred) {
+                    greetingState.schemaInitialized = !!(readCardApiMetadata().schemaKeys || []).length;
+                    greetingState.appliedFp = preparedOpening.opening.fp;
+                    greetingState.appliedSourceFp = preparedOpening.opening.sourceFp || '';
+                    greetingState.pendingFp = '';
+                    greetingState.pendingSourceFp = '';
+                    greetingState.pendingAt = 0;
+                    scheduleGreetingMessageWrite(preparedOpening.opening, greetingState);
+                }
+                if (hadHistoricalCheckpointBeforeInit && !greetingState.created && !greetingState.appliedFp && !greetingState.pendingFp) {
+                    greetingState.baselineNext = true;
+                }
+                // 旧聊天已有数据库状态时，所有现存更新块都是历史，只登记不重放；
+                // 新聊天的首楼交给开场合并初始化，初始化时已经存在的其他楼层也不擅自迁移。
+                baselineMessageUpdateBlocks(hadHistoricalCheckpointBeforeInit);
+                installWindowGetAllVariables();
+                installWindowMvuShim();
+                installTableUpdateHook();
+                // 只有“本次进入时尚无 full checkpoint，刚由初始化新建”才开启
+                // 首楼载体连续性保护。重进旧聊天绝不武断恢复开场快照。
+                let freshCheckpointFromBridge = false;
+                try {
+                    const freshMark = hostWindow.__mvu2ledgerFreshOpeningCheckpoint;
+                    freshCheckpointFromBridge = !!(freshMark && freshMark.chatKey === key && Date.now() - Number(freshMark.at || 0) < 120000);
+                } catch (e) {}
+                if ((!hadHistoricalCheckpointBeforeInit || freshCheckpointFromBridge) && mvu2ledgerChatHasFullCheckpoint() && openingChatIsShort()) {
+                    try {
+                        const initAll = window.getAllVariables ? window.getAllVariables() : { stat_data: {} };
+                        armOpeningContinuity(key, initAll && initAll.stat_data ? initAll.stat_data : {});
+                        if (freshCheckpointFromBridge) hostWindow.__mvu2ledgerFreshOpeningCheckpoint = null;
+                    } catch (e) {}
+                }
+                // 建表/初始化成功（或聊天已有 checkpoint 跳过）≈ MVU 的 VARIABLE_INITIALIZED 时机。
+                // 不能立刻广播：插件回放/物化可能尚未完成，此刻 getAllVariables 可能返回空/旧值，
+                // 前端收到后重读会显示默认值并写回。等 stat_data 非空后再派发（见 scheduleDataReadyNotify）。
+                scheduleDataReadyNotify();
+                // 多分支开场：表格就绪后按当前激活分支注入其 <initvar>（MVU 按分支替换语义）
+                hostWindow.setTimeout(applyActiveGreetingInitvar, 300);
+                hostWindow.setTimeout(applyPendingMessageUpdateBlocks, 900);
+                startGreetingInitvarPoll();
+            }
+        } catch (e) {
+            if (!isRuntimeSessionCurrent(session)) return;
+            console.warn('[mvu2ledger] 开局自动建表异常：' + (e && e.message ? e.message : e));
+            autoInitState.done = '';
+            autoInitState.retries += 1;
+            if (autoInitState.retries < 15) hostWindow.setTimeout(autoInitDatabase, 4000);
+        } finally {
+            hostWindow.clearTimeout(initWatchdog);
+            if (autoInitState.session === session) autoInitState.running = false;
+        }
+    }
+
+    // 判断角色卡正则是否依赖 <StatusPlaceHolderImpl/>（前端注入占位符）
+    function detectPlaceholderFor(character) {
+        try {
+            // 只有本转换器产物的卡才维护状态栏占位符，其他卡即使正则里碰巧含同名串也不处理
+            if (!isConvertedMvuCard(character)) return false;
+            const phExt = charExtensions(character);
+            const rx = phExt && phExt.regex_scripts;
+            if (!Array.isArray(rx)) return false;
+            return rx.some(r => String(r.findRegex || '').indexOf('StatusPlaceHolderImpl') !== -1);
+        } catch (e) { return false; }
+    }
+
+    // 扩展本体复刻 MVU 的占位符维护：AI 回复后若缺少占位符则追加，前端注入正则才能命中每条消息
+    let lastPlaceholderMsgKey = '';
+    let lastPlaceholderAt = 0;
+    let placeholderRetryTimer = null;
+    let placeholderRetryCount = 0;
+    function findSetChatMessages() {
+        try { const context = getContextSafe(); if (context && typeof context.setChatMessages === 'function') return context.setChatMessages.bind(context); } catch (e) {}
+        try { if (typeof window.setChatMessages === 'function') return window.setChatMessages; } catch (e) {}
+        for (const r of [window, hostWindow]) {
+            try { if (r.TavernHelper && typeof r.TavernHelper.setChatMessages === 'function') return r.TavernHelper.setChatMessages.bind(r.TavernHelper); } catch (e) {}
+            try { if (typeof r.setChatMessages === 'function') return r.setChatMessages; } catch (e) {}
+        }
+        return null;
+    }
+    const statusMessageWrites = new WeakSet();
+    async function saveRuntimeMessage(context, msg, messageId, text, next, session) {
+        if (!isRuntimeSessionCurrent(session) || context.chat[messageId] !== msg ||
+            String(msg.mes != null ? msg.mes : (msg.message || '')) !== text || statusMessageWrites.has(msg)) return false;
+        statusMessageWrites.add(msg);
+        try {
+            const setter = findSetChatMessages();
+            if (setter) {
+                const es = context.eventSource || context.event_source;
+                const renderedEvent = context.event_types && context.event_types.CHARACTER_MESSAGE_RENDERED;
+                let useHostRender = false;
+                try {
+                    const surface = hostWindow.__TAURITAVERN__ && hostWindow.__TAURITAVERN__.api && hostWindow.__TAURITAVERN__.api.chatSurface;
+                    // 仅 TT 静态路径绕开助手的 .empty().append()；虚拟化仍交给助手的 participant。
+                    useHostRender = !!(surface && typeof surface.isManagedOwnershipRequired === 'function'
+                        && surface.isManagedOwnershipRequired() === false
+                        && typeof context.updateMessageBlock === 'function'
+                        && es && typeof es.emit === 'function' && renderedEvent);
+                } catch (_) {}
+                let sameDisplay = false;
+                if (useHostRender && typeof context.messageFormatting === 'function'
+                    && !msg.is_system && !(msg.extra && (msg.extra.display_text != null || msg.extra.uses_system_ui))) {
+                    try {
+                        const format = value => context.messageFormatting(value, msg.name, msg.is_system, msg.is_user, messageId, {}, false);
+                        const beforeHtml = format(text), afterHtml = format(next);
+                        sameDisplay = typeof beforeHtml === 'string' && beforeHtml === afterHtml;
+                    } catch (_) {}
+                }
+                await setter([{ message_id: messageId, message: next, mes: next }], { refresh: useHostRender ? 'none' : 'affected' });
+                // 保存可能异步完成；不得随后用旧聊天的任务刷新新聊天。
+                const current = getContextSafe();
+                if (!isRuntimeSessionCurrent(session) || !current || current.chat[messageId] !== msg) return false;
+                if (useHostRender && !sameDisplay && context.chat[messageId] === msg && msg.mes === next) {
+                    await context.updateMessageBlock(messageId, msg);
+                    if (!isRuntimeSessionCurrent(session)) return false;
+                    await es.emit(renderedEvent, messageId);
+                }
+                dbg('[状态显示] 已更新消息 id=' + messageId);
+            } else {
+                // 找不到 setChatMessages：只改内存，不调 saveChat（避免每次保存超时形成风暴）；
+                // 落盘依赖酒馆自身保存，显示刷新依赖酒馆重渲染
+                msg.mes = next; if (msg.message !== undefined) msg.message = next;
+                if (!window.__mvu2ledgerPlaceholderFallbackWarned) {
+                    window.__mvu2ledgerPlaceholderFallbackWarned = true;
+                    dbgWarn('[占位符] 未找到 setChatMessages，已直接写入内存消息（依赖酒馆下次保存落盘；若前端未刷新请升级酒馆）');
+                }
+            }
+            return true;
+        } finally { statusMessageWrites.delete(msg); }
+    }
+
+    // 复刻 MVU 的回复后清理，扩展到单数/复数完整块；不猜残缺、嵌套或带属性的块。
+    function stripReplyStatusBlocks(text) {
+        const tokens = /<(\/?)(status_current_variables?)\b([^<>]*)>/gi;
+        const stack = [], ranges = [];
+        let start = -1, nested = false, invalid = false, match;
+        while ((match = tokens.exec(text))) {
+            const closing = !!match[1], name = match[2].toLowerCase();
+            if (!closing) {
+                if (!stack.length) { start = match.index; nested = false; invalid = false; }
+                else nested = true;
+                if (match[3] !== '') invalid = true;
+                stack.push(name);
+            } else if (stack.length) {
+                if (match[3] !== '' || stack.pop() !== name) invalid = true;
+                if (!stack.length) {
+                    if (!nested && !invalid) ranges.push([start, tokens.lastIndex]);
+                    start = -1;
+                }
+            }
+        }
+        for (let i = ranges.length - 1; i >= 0; i--) text = text.slice(0, ranges[i][0]) + text.slice(ranges[i][1]);
+        return text;
+    }
+    // 变量提交与正文保存分别去重：正文失败重试不能重新执行增量命令或作者回调。
+    const mvuMessageWrites = new Map();
+    const messageUpdatesInProgress = new WeakSet();
+    function messageUpdateBusy(msg, messageId) {
+        if (messageUpdatesInProgress.has(msg) || mvuMessageWrites.has(msg) ||
+            (messageId === 0 && autoInitState.running)) return true;
+        if (messageId > 0 && msg && !msg.is_user && !msg.is_system && msg.role !== 'system' && msg.role !== 'user') {
+            const key = autoInitChatId(), state = messageUpdateState(key), fp = messageUpdateFingerprint(msg, messageId);
+            return !!fp && greetingInitState(key).ready && state.baselined && !state.processed.has(fp);
+        }
+        return false;
+    }
+    function cancelMvuMessageWrites() {
+        for (const job of mvuMessageWrites.values()) if (job.timer != null) hostWindow.clearTimeout(job.timer);
+        mvuMessageWrites.clear();
+    }
+    function armMvuMessageWrite(job, delay = 0) {
+        if (job.timer != null || job.running) return;
+        job.timer = hostWindow.setTimeout(() => { job.timer = null; finishMvuMessageWrite(job); }, delay);
+    }
+    async function finishMvuMessageWrite(job) {
+        if (mvuMessageWrites.get(job.msg) !== job || job.running) return;
+        const retire = () => { if (mvuMessageWrites.get(job.msg) === job) mvuMessageWrites.delete(job.msg); };
+        let repeat = false;
+        job.running = true;
+        try {
+            const ctx = getContextSafe(), msg = ctx && ctx.chat && ctx.chat[job.messageId];
+            const currentText = msg && String(msg.mes != null ? msg.mes : (msg.message || ''));
+            if (!isRuntimeSessionCurrent(job.session) || msg !== job.msg ||
+                Number(msg.swipe_id || 0) !== job.swipe || (currentText !== job.text && currentText !== job.attemptedText)) {
+                retire(); return;
+            }
+            if (ctx.generating === true || ctx.isStreaming === true) { repeat = true; return; }
+            let next = stripReplyStatusBlocks(job.next);
+            if (detectPlaceholderFor(currentCharacter()) && !next.includes('<StatusPlaceHolderImpl/>')) next += '\n\n<StatusPlaceHolderImpl/>';
+            // 助手可能先改内存再在刷新/保存阶段报错；这种情况下仍提交相同正文，
+            // 不将自己的改写视为用户编辑，也不重新执行变量命令。
+            const unchanged = next === currentText && job.attemptedText == null;
+            job.attemptedText = next;
+            if (unchanged || await saveRuntimeMessage(ctx, msg, job.messageId, currentText, next, job.session)) {
+                if (job.onSaved) job.onSaved(next);
+                retire();
+            } else repeat = true;
+        } catch (e) { dbgWarn('[MVU正文] 回调正文保存失败:', e); repeat = true; }
+        finally {
+            job.running = false;
+            if (repeat) {
+                if (++job.retries <= 10 && mvuMessageWrites.get(job.msg) === job) armMvuMessageWrite(job, 1000);
+                else { retire(); dbgWarn('[MVU正文] 回调正文保存未完成，已停止重试。'); }
+            }
+        }
+    }
+    function scheduleMvuMessageWrite(msg, messageId, text, next, swipe, onSaved) {
+        if (typeof next !== 'string') { dbgWarn('[MVU正文] message_content 必须是字符串，保留原正文。'); return; }
+        if (next === text) return;
+        const ctx = getContextSafe();
+        if (!ctx || ctx.chat[messageId] !== msg || Number(msg.swipe_id || 0) !== swipe ||
+            String(msg.mes != null ? msg.mes : (msg.message || '')) !== text) return;
+        const session = captureRuntimeSession(() => {
+            const current = getContextSafe();
+            return !!current && current.chat[messageId] === msg && Number(msg.swipe_id || 0) === swipe;
+        });
+        const old = mvuMessageWrites.get(msg);
+        if (old && old.timer != null) hostWindow.clearTimeout(old.timer);
+        const job = { msg, messageId, text, next, swipe, session, onSaved, retries: 0, timer: null, running: false };
+        mvuMessageWrites.set(msg, job);
+        armMvuMessageWrite(job);
+    }
+    function scheduleGreetingMessageWrite(prepared, state) {
+        scheduleMvuMessageWrite(prepared.first, 0, prepared.text, prepared.messageContent, prepared.swipe, () => {
+            const source = activeGreetingSourceSnapshot();
+            // 回调可以移除或更改更新块；将修改后的来源登记为已完成，不能重新初始化。
+            if (source && source.first === prepared.first) state.appliedSourceFp = source.sourceFp;
+        });
+    }
+    const replyStatusCleanups = new Map();
+    function cancelReplyStatusCleanups() {
+        for (const job of replyStatusCleanups.values()) if (job.timer != null) hostWindow.clearTimeout(job.timer);
+        replyStatusCleanups.clear();
+    }
+    function armReplyStatusCleanup(job, delay = 1200) {
+        if (job.timer != null || job.running) return;
+        job.timer = hostWindow.setTimeout(() => { job.timer = null; finishReplyStatusCleanup(job); }, delay);
+    }
+    async function finishReplyStatusCleanup(job) {
+        if (replyStatusCleanups.get(job.key) !== job || job.running) return;
+        const retire = () => { if (replyStatusCleanups.get(job.key) === job) replyStatusCleanups.delete(job.key); };
+        const retry = () => { if (++job.retries <= 10 && replyStatusCleanups.get(job.key) === job) armReplyStatusCleanup(job, 1000); else retire(); };
+        let repeat = false;
+        job.running = true;
+        try {
+            const context = getContextSafe(), msg = context && context.chat && context.chat[job.messageId];
+            if (!isRuntimeSessionCurrent(job.session) || !isConvertedMvuCard(currentCharacter()) || msg !== job.msg ||
+                Number(msg.swipe_id || 0) !== job.swipe || msg.is_user || msg.is_system ||
+                msg.role === 'user' || msg.role === 'system' || String(msg.name || '') === 'System') { retire(); return; }
+            if (context.generating === true || context.isStreaming === true || messageUpdateBusy(msg, job.messageId)) { repeat = true; return; }
+            const text = String(msg.mes != null ? msg.mes : (msg.message || ''));
+            let next = stripReplyStatusBlocks(text);
+            if (next === text) { retire(); return; }
+            if (detectPlaceholderFor(currentCharacter()) && !next.includes('<StatusPlaceHolderImpl/>')) next += '\n\n<StatusPlaceHolderImpl/>';
+            if (await saveRuntimeMessage(context, msg, job.messageId, text, next, job.session)) retire();
+            else repeat = true;
+        } catch (e) { dbgWarn('[状态显示] 回复清理失败:', e); repeat = true; }
+        finally { job.running = false; if (repeat) retry(); }
+    }
+    function scheduleReplyStatusCleanup(messageId) {
+        const context = getContextSafe();
+        if (!isConvertedMvuCard(currentCharacter()) || !context || !Array.isArray(context.chat)) return;
+        const id = Number.isInteger(messageId) ? messageId : context.chat.length - 1;
+        const msg = context.chat[id];
+        if (!msg || msg.is_user || msg.is_system || msg.role === 'user' || msg.role === 'system' || String(msg.name || '') === 'System') return;
+        const session = captureRuntimeSession(), swipe = Number(msg.swipe_id || 0), key = session.key + ':' + id + ':' + swipe;
+        let job = replyStatusCleanups.get(key);
+        if (!job || job.msg !== msg) {
+            if (job && job.timer != null) hostWindow.clearTimeout(job.timer);
+            job = { key, session, messageId: id, msg, swipe, retries: 0, timer: null, running: false };
+            replyStatusCleanups.set(key, job);
+        }
+        armReplyStatusCleanup(job);
+    }
+
+    async function ensureWindowStatusPlaceholder() {
+        if (!activePlaceholderNeeded) return;
+        try {
+            const context = getContextSafe();
+            if (!context || !Array.isArray(context.chat) || !context.chat.length) {
+                return;
+            }
+            // 生成/流式过程中不追加，避免每次流更新都把占位符覆盖后再补（反复注入）；
+            // 若事件触发时 generating 仍为 true 导致错过，1 秒后补一次（最多 10 次），保证收尾必补（MVU 同款语义）
+            if (context.generating === true || context.isStreaming === true ||
+                messageUpdateBusy(context.chat[context.chat.length - 1], context.chat.length - 1)) {
+                if (!placeholderRetryTimer && placeholderRetryCount < 10) {
+                    placeholderRetryTimer = hostWindow.setTimeout(() => {
+                        placeholderRetryTimer = null;
+                        placeholderRetryCount += 1;
+                        ensureWindowStatusPlaceholder();
+                    }, 1000);
+                }
+                return;
+            }
+            placeholderRetryCount = 0;
+            const msg = context.chat[context.chat.length - 1];
+            if (!msg) return;
+            if (msg.is_user || String(msg.name || '') === 'System') return;
+            const text = String(msg.mes != null ? msg.mes : (msg.message || ''));
+            if (text.indexOf('<StatusPlaceHolderImpl/>') !== -1) return;
+            const session = captureRuntimeSession();
+            const messageId = msg.message_id != null ? msg.message_id : (context.chat.length - 1);
+            const msgKey = session.key + ':' + messageId + ':' + text.length;
+            const now = Date.now();
+            if (msgKey === lastPlaceholderMsgKey && now - lastPlaceholderAt < 5000) return;
+            const next = text + '\n\n<StatusPlaceHolderImpl/>';
+            if (!await saveRuntimeMessage(context, msg, messageId, text, next, session)) return;
+            lastPlaceholderMsgKey = msgKey;
+            lastPlaceholderAt = now;
+        } catch (e) {
+            dbgWarn('[占位符] 追加失败:', e);
+        }
+    }
+
+    // 数据就绪通知：刷新/重进/切聊天后，前端（尤其整页注入式常驻前端）在插件异步回放完成前
+    // 可能已读旧/空数据，而插件加载完成不主动通知前端。这里在 stat_data 非空后分三次广播：
+    //   - VARIABLE_INITIALIZED：HypnosisAPP5 等前端在收到它时才会重读 userData 并重渲染；
+    //   - VARIABLE_UPDATE_ENDED：刷新主页时钟/成就列表。
+    // 用 stat_data 指纹去重：同一份数据只广播一次，数据变化（如回放完成）后再广播。
+    function scheduleDataReadyNotify() {
+        const dispatch = async () => {
+            try {
+                if (!activeLayout) return;
+                const allR = window.getAllVariables ? window.getAllVariables() : { stat_data: {} };
+                const sdR = allR.stat_data || {};
+                // “有真实数据”判定：必须存在至少一个非空叶子值。
+                // 空壳快照（回放窗口里行表全 {}、单例缺字段）顶层组也有键，
+                // 若按“组有键”判定会把它当就绪广播 → 前端反复重读成“暂无/默认值”，
+                // 与随后全量快照来回横跳（用户反馈“一直刷然后读不到”）。
+                const hasMeaningfulData = (v) => {
+                    if (v === undefined || v === null) return false;
+                    if (typeof v === 'string') return v !== '';
+                    if (typeof v === 'number') return v !== 0;
+                    if (typeof v === 'boolean') return v !== false;
+                    if (Array.isArray(v)) return v.length > 0;
+                    if (typeof v === 'object') {
+                        for (const k in v) { if (hasMeaningfulData(v[k])) return true; }
+                        return false;
+                    }
+                    return false;
+                };
+                let hasData = false;
+                for (const g in sdR) {
+                    if (hasMeaningfulData(sdR[g])) { hasData = true; break; }
+                }
+                if (!hasData && Object.keys(sdR).length) {
+                    // 全为 0/false/空容器也可以是真实状态；完整运行时或持久化快照证明它已就绪。
+                    const snapshot = captureCompleteRuntimeTableSnapshot();
+                    const ready = mvuDataFromCompleteTableSnapshot(snapshot ? snapshot.data : readPersistedTableData());
+                    hasData = !!(ready && canonicalJsonForSync(ready.stat_data) === canonicalJsonForSync(sdR));
+                }
+                if (!hasData) return; // 空壳且未就绪的快照不广播
+                // 指纹带聊天标识：进新聊天必广播一次，同聊天内同一份数据不重复广播。
+                // 不再在每次调用时重置指纹——CHAT_CHANGED + 建表成功会连续多次调用
+                // scheduleDataReadyNotify，旧实现导致同一份数据被反复广播、前端反复重置。
+                let chatKey = '';
+                try { chatKey = autoInitChatId(); } catch (e) {}
+                // 指纹统一用键序无关的 canonical 序列化：写侧广播载荷与 SP 回调反投影
+                // 快照的键序不保证一致，原生 stringify 会让同一逻辑状态得到两个不同
+                // 指纹而漏拦回声（前端反复刷新）。
+                const fp = chatKey + '|' + canonicalJsonForSync(sdR);
+                if (fp === reentryNotifyFingerprint) return; // 数据未变化，不重复广播
+                reentryNotifyFingerprint = fp;
+                dbg('[重读通知] 就绪后 stat_data 快照: ' + JSON.stringify(sdR).slice(0, 160));
+                let swipeId = 0;
+                try {
+                    const cx = getContextSafe();
+                    const cc = cx && Array.isArray(cx.chat) ? cx.chat : [];
+                    for (let si = cc.length - 1; si >= 0; si--) { if (cc[si] && !cc[si].is_user) { swipeId = Number(cc[si].swipe_id || 0); break; } }
+                } catch (e) {}
+                emitMvuEvent('mag_variable_initialized', allR, swipeId);
+                dispatchVariableUpdateEnded();
+                dbg('[重读通知] 已派发 VARIABLE_INITIALIZED + VARIABLE_UPDATE_ENDED 让前端重读最新 stat_data');
+            } catch (e) {}
+        };
+        hostWindow.setTimeout(() => { dispatch(); }, 1500);
+        hostWindow.setTimeout(() => { dispatch(); }, 3500);
+        hostWindow.setTimeout(() => { dispatch(); }, 6000);
+    }
+
+    // 开场白多分支按所选分支注入初始化（MVU 语义：每个 swipe 的 <initvar> 独立替换初始状态）。
+    // 转换时只以首个分支为模板基准，这里在开局/换 swipe 时把“当前激活分支”的 <initvar>
+    // 写入数据库（覆盖模板初始行），避免多分支状态被合并。
+    // 按聊天记录分支初始化状态：大型卡一次差异写入可能超过 2s，
+    // 若只在写完后设指纹，2s 轮询会在途中重复提交，使旧回调失效并形成
+    // manual_crud → persist → v2-replay 循环。pendingFp 是在途去重，appliedFp 是已落定去重。
+    const greetingInitStateByChat = Object.create(null);
+    function greetingInitState(chatKey) {
+        const key = runtimeScopedChatKey(chatKey);
+        if (!greetingInitStateByChat[key]) {
+            greetingInitStateByChat[key] = {
+                ready: false,
+                baselineNext: false,
+                created: false,
+                schemaInitialized: false,
+                appliedFp: '',
+                appliedSourceFp: '',
+                pendingFp: '',
+                pendingSourceFp: '',
+                pendingAt: 0,
+            };
+        }
+        pruneChatKeyedObject(greetingInitStateByChat);
+        return greetingInitStateByChat[key];
+    }
+    const greetingMacroCache = Object.create(null);
+    function greetingDynamicKeyPaths(layoutEntries) {
+        const out = [];
+        const add = (p) => {
+            if (!Array.isArray(p) || !p.length) return;
+            const key = p.join('\u0001');
+            if (!out.some(x => x.join('\u0001') === key)) out.push(p.slice());
+        };
+        for (const L of (Array.isArray(layoutEntries) ? layoutEntries : [])) {
+            if (!L) continue;
+            if (L.kind === 'rows') {
+                for (const p of (Array.isArray(L.writePaths) ? L.writePaths : [])) add(p);
+            } else if (L.kind === 'nestedRows') {
+                const pp = Array.isArray(L.parentPath) ? L.parentPath : [];
+                add(pp);
+                add(pp.concat('*', L.childKey || ''));
+            }
+        }
+        return out;
+    }
+    function messageUpdateBlocks(text) {
+        return (String(text || '').match(/<(?:UpdateVariable|JSON_?Patch)\b[^>]*>[\s\S]*?<\/(?:UpdateVariable|JSON_?Patch)>/gi) || []).join('\n');
+    }
+    // 2s 轮询热点缓存：首楼对象与文本引用未变（编辑/换分支会生成新字符串或新对象）
+    // 时直接复用上次快照，避免每 2 秒对长首楼重跑 <initvar>/UpdateVariable 正则。
+    let greetingSourceSnapCache = null;
+    function activeGreetingSourceSnapshot() {
+        const ctx = getContextSafe();
+        const chat = Array.isArray(ctx.chat) ? ctx.chat : [];
+        const first = chat[0];
+        if (!first || first.is_user) return null;
+        const hasSchema = !!(readCardApiMetadata().schemaKeys || []).length;
+        const text = String(first.mes != null ? first.mes : (first.message || ''));
+        let swipeId = '';
+        try { swipeId = String(first.swipe_id == null ? 0 : first.swipe_id); } catch (e) {}
+        const hit = greetingSourceSnapCache;
+        if (hit && hit.first === first && hit.text === text && hit.swipeId === swipeId && hit.hasSchema === hasSchema) return hit.snap;
+        const m = text.match(/<initvar>\s*\n?([\s\S]*?)\n?\s*<\/initvar>/i);
+        const updateSource = messageUpdateBlocks(text);
+        if (!m && !updateSource && !hasSchema) {
+            // 无初始化任务的首楼也缓存；Schema 元数据晚到时须重新检查。
+            greetingSourceSnapCache = { first, text, swipeId, hasSchema, snap: null };
+            return null;
+        }
+        const schemaOnly = !m && !updateSource;
+        const sourceText = (m ? String(m[1]) : (schemaOnly ? 'worldbook-schema-init' : 'no-initvar')) + '\n' + String(updateSource || '');
+        const core = window.MVU2LEDGER_CORE;
+        const sourceFp = core && typeof core.stableHash === 'function' ? core.stableHash(sourceText) : sourceText;
+        const snap = { first, text, m, updateSource, schemaOnly, swipe: Number(first.swipe_id || 0), sourceFp: String(sourceFp || '') };
+        greetingSourceSnapCache = { first, text, swipeId, hasSchema, snap };
+        return snap;
+    }
+    function guardGreetingSource(session, source) {
+        const previous = session.validate;
+        session.validate = () => {
+            const ctx = getContextSafe(), msg = ctx && ctx.chat && ctx.chat[0];
+            return (!previous || previous()) && msg === source.first && Number(msg.swipe_id || 0) === source.swipe &&
+                String(msg.mes != null ? msg.mes : (msg.message || '')) === source.text;
+        };
+    }
+    async function computeActiveGreetingSnapshot(baseAll, sourceSnapshot, options = {}) {
+        const source = sourceSnapshot || activeGreetingSourceSnapshot();
+        if (!source) return null;
+        const { first, text, m, updateSource, sourceFp } = source;
+        const ctx = getContextSafe();
+        const core = window.MVU2LEDGER_CORE;
+        if (!core || (m && typeof core.parseInitVar !== 'function')) return null;
+        const currentAll = baseAll && typeof baseAll === 'object'
+            ? baseAll
+            : (window.getAllVariables ? window.getAllVariables() : { stat_data: {}, display_data: {}, delta_data: {} });
+        let parsed = m ? core.parseInitVar(m[1]) : JSON.parse(JSON.stringify(currentAll.stat_data || {}));
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+        if (m && typeof core.analyzeMvuInitMetadata === 'function') {
+            parsed = core.analyzeMvuInitMetadata(parsed).data;
+        }
+        const macroSource = m ? String(m[1]) : '';
+        const macroKey = autoInitChatId() + '|' + (typeof core.stableHash === 'function' ? core.stableHash(macroSource) : macroSource);
+        if (m && greetingMacroCache[macroKey]) {
+            parsed = JSON.parse(JSON.stringify(greetingMacroCache[macroKey]));
+        } else if (/<(?:USER|BOT|CHAR|CHARIFNOTGROUP|GROUP)>/i.test(macroSource) || /\{\{[\s\S]*?\}\}/.test(macroSource)) {
+            if (typeof ctx.substituteParams !== 'function' || typeof core.resolveInitDataMacros !== 'function') {
+                dbgWarn(' 开场分支含宏，但 SillyTavern substituteParams 尚未就绪，等待重试。');
+                return null;
+            }
+            parsed = core.resolveInitDataMacros(parsed, ctx.substituteParams.bind(ctx), greetingDynamicKeyPaths(activeLayout));
+            greetingMacroCache[macroKey] = JSON.parse(JSON.stringify(parsed));
+            pruneChatKeyedObject(greetingMacroCache, 128);
+        }
+        let fp = '';
+        try {
+            const updateFp = updateSource && typeof core.stableHash === 'function' ? core.stableHash(updateSource) : updateSource;
+            fp = (m ? JSON.stringify(parsed) : 'no-initvar') + '|' + String(updateFp || '');
+        } catch (e) { fp = ''; }
+        let finalWrap = {
+            stat_data: parsed,
+            display_data: JSON.parse(JSON.stringify(currentAll.display_data || {})),
+            delta_data: JSON.parse(JSON.stringify(currentAll.delta_data || {})),
+        };
+        let messageContent = text;
+        if (updateSource) {
+            finalWrap = await runMvuUpdateCycle(text, finalWrap);
+            const updateContext = { variables: finalWrap, message_content: text };
+            await emitMvuEvent('mag_before_message_update', updateContext);
+            finalWrap = updateContext.variables || finalWrap;
+            messageContent = updateContext.message_content;
+        } else if ((m || source.schemaOnly) && !options.deferSchema) {
+            // Worldbook-seeded state needs the same author validation as inline
+            // InitVar. Run it after data is available, allowing scripts that
+            // register their Schema only after Mvu initialization to proceed.
+            finalWrap.stat_data = await validateCardStat(finalWrap.stat_data);
+            finalWrap.display_data = JSON.parse(JSON.stringify(finalWrap.stat_data));
+        }
+        return { first, text, messageContent, swipe: source.swipe, hasInitvar: !!m,
+            schemaDeferred: !!((m || source.schemaOnly) && !updateSource && options.deferSchema),
+            updateSource, sourceFp, fp, baseStat: currentAll.stat_data || {}, finalWrap };
+    }
+
+    async function applyActiveGreetingInitvar() {
+        const session = captureRuntimeSession();
+        let activePendingState = null;
+        let activePendingFp = '';
+        try {
+            const chatKey = autoInitChatId();
+            const greetingState = greetingInitState(chatKey);
+            if (!greetingState.ready) return;
+            // 轮询只负责发现首楼来源是否变化。必须在 runMvuUpdateCycle /
+            // mag_before_message_update 之前去重；否则即使最终快照指纹相同，
+            // 每 2 秒仍会执行卡脚本并保存聊天，恰好会打断 SP 的自动填表窗口。
+            const sourceSnapshot = activeGreetingSourceSnapshot();
+            if (!sourceSnapshot || mvuMessageWrites.has(sourceSnapshot.first)) return;
+            const sourceFp = sourceSnapshot.sourceFp;
+            if (sourceFp && sourceFp === greetingState.appliedSourceFp) return;
+            if (sourceFp && sourceFp === greetingState.pendingSourceFp && Date.now() - greetingState.pendingAt < 60000) return;
+            greetingState.pendingSourceFp = sourceFp;
+            greetingState.pendingAt = Date.now();
+            activePendingState = greetingState;
+            guardGreetingSource(session, sourceSnapshot);
+            const prepared = await computeActiveGreetingSnapshot(undefined, sourceSnapshot,
+                { deferSchema: !!(greetingState.baselineNext && sourceSnapshot.schemaOnly) });
+            if (!isRuntimeSessionCurrent(session)) {
+                greetingState.pendingSourceFp = '';
+                greetingState.pendingAt = 0;
+                return;
+            }
+            if (!prepared) {
+                greetingState.pendingSourceFp = '';
+                greetingState.pendingAt = 0;
+                return;
+            }
+            const fp = prepared.fp;
+            if (greetingState.baselineNext) {
+                greetingState.baselineNext = false;
+                greetingState.appliedFp = fp;
+                greetingState.appliedSourceFp = sourceFp;
+                greetingState.pendingFp = '';
+                greetingState.pendingSourceFp = '';
+                greetingState.pendingAt = 0;
+                dbg('[开场分支] 已有 checkpoint，仅建立当前分支指纹基线，不重写存档。');
+                return;
+            }
+            if (fp && fp === greetingState.appliedFp) {
+                greetingState.appliedSourceFp = sourceFp;
+                greetingState.pendingSourceFp = '';
+                greetingState.pendingAt = 0;
+                return;
+            }
+            greetingState.pendingFp = fp;
+            activePendingFp = fp;
+            const finalStat = (prepared.finalWrap && prepared.finalWrap.stat_data) || prepared.baseStat;
+            // The opening evaluator already ran the author's Schema/update cycle.
+            // Persist its complete result, as MVU does after initialization, rather
+            // than applying non-idempotent transforms again in the write adapter.
+            if (!prepared.schemaDeferred) {
+                session.rawAuthorWrite = true;
+                session.schemaProof = currentCardApi && currentCardApi.proofOf(finalStat);
+            }
+            dbg('[开场分支] 按当前分支注入' + (prepared.hasInitvar ? ' <initvar>' : '') + (prepared.updateSource ? ' <UpdateVariable/JSONPatch>' : '') + '（swipe=' + String(prepared.first.swipe_id == null ? 0 : prepared.first.swipe_id) + '，顶层组 ' + Object.keys(finalStat).join('、') + '）。');
+            scheduleWindowStatOverlay(finalStat, (ok) => {
+                if (greetingState.pendingFp !== fp) return;
+                greetingState.pendingFp = '';
+                greetingState.pendingSourceFp = '';
+                greetingState.pendingAt = 0;
+                if (ok) {
+                    greetingState.schemaInitialized = !!(readCardApiMetadata().schemaKeys || []).length;
+                    greetingState.appliedFp = fp;
+                    greetingState.appliedSourceFp = sourceFp;
+                    scheduleGreetingMessageWrite(prepared, greetingState);
+                }
+                else dbgWarn(' 开场分支初始化/更新块注入未落定（写入被丢弃或失败），保留指纹待轮询重试。');
+            }, false, true, chatKey, session);
+        } catch (e) {
+            if (activePendingState && activePendingState.pendingFp === activePendingFp) {
+                activePendingState.pendingFp = '';
+                activePendingState.pendingSourceFp = '';
+                activePendingState.pendingAt = 0;
+            }
+            dbgWarn(' 开场分支初始化/更新块注入失败:', e);
+        }
+    }
+
+    // 扩展成为唯一 runtime owner 后，卡内薄桥不再扫描消息更新块；这里接管首楼之后
+    // 的 UpdateVariable/JSONPatch。已有 checkpoint 只建立基线，绝不重放历史消息。
+    const messageUpdateStateByChat = Object.create(null);
+    // 会话级 per-chat 状态随访问聊天数单调增长；按插入序保留最近若干条，被淘汰的
+    // 聊天重进时按“新聊天”语义重建基线/指纹（与首次进入一致，无重放风险）。
+    const CHAT_STATE_KEEP = 40;
+    function pruneChatKeyedObject(store, keep) {
+        try {
+            const keys = Object.keys(store);
+            const limit = keep || CHAT_STATE_KEEP;
+            if (keys.length <= limit) return;
+            for (let i = 0; i < keys.length - limit; i++) delete store[keys[i]];
+        } catch (e) {}
+    }
+    function pruneOrderedCollection(coll, keep) {
+        try {
+            const limit = keep || CHAT_STATE_KEEP;
+            if (coll instanceof Map || coll instanceof Set) {
+                const excess = coll.size - limit;
+                if (excess > 0) {
+                    const it = coll.keys();
+                    for (let i = 0; i < excess; i++) coll.delete(it.next().value);
+                }
+            }
+        } catch (e) {}
+    }
+    function messageUpdateState(chatKey) {
+        const key = runtimeScopedChatKey(chatKey);
+        if (!messageUpdateStateByChat[key]) messageUpdateStateByChat[key] = { baselined: false, running: false, processed: new Set(), pending: new Set() };
+        pruneChatKeyedObject(messageUpdateStateByChat);
+        return messageUpdateStateByChat[key];
+    }
+    // 指纹缓存：applyPendingMessageUpdateBlocks 被 6 个事件入口反复调度，每次都会
+    // 对全部楼层重跑消息正则。楼层对象与其 mes 字符串引用在未编辑/未换 swipe 时不变
+    // （编辑会生成新字符串），引用一致即可直接复用上次指纹，把每次事件的开销从
+    // O(N×正则) 降为 O(N) 引用比较。WeakMap 随消息对象被丢弃自动回收。
+    const messageUpdateFpCache = new WeakMap();
+    let messageUpdateObjectSeq = 0;
+    function messageUpdateFingerprint(message, index) {
+        const text = String(message && (message.mes != null ? message.mes : message.message) || '');
+        const swipe = String(message && message.swipe_id == null ? 0 : message.swipe_id);
+        let cached = null;
+        try { cached = messageUpdateFpCache.get(message); } catch (e) {}
+        if (cached && cached.text === text && cached.swipe === swipe && cached.index === index) return cached.fp;
+        const blocks = messageUpdateBlocks(text);
+        if (!blocks) return '';
+        const core = window.MVU2LEDGER_CORE;
+        const hash = core && typeof core.stableHash === 'function' ? core.stableHash(blocks) : blocks;
+        // 同楼重生成可产生完全相同的更新块，但新回复仍需执行；删去前面的楼层
+        // 只改变索引，不能使已有回复再次执行。用消息对象身份区分这两种情况。
+        const objectId = cached ? cached.objectId : ++messageUpdateObjectSeq;
+        const fp = String(objectId) + '|' + swipe + '|' + String(hash);
+        try { messageUpdateFpCache.set(message, { text, swipe, index, fp, objectId }); } catch (e) {}
+        return fp;
+    }
+    function baselineMessageUpdateBlocks(includeGreeting) {
+        try {
+            const chatKey = autoInitChatId();
+            const st = messageUpdateState(chatKey);
+            const ctx = getContextSafe();
+            const chat = Array.isArray(ctx.chat) ? ctx.chat : [];
+            for (let i = includeGreeting ? 0 : 1; i < chat.length; i++) {
+                if (!chat[i] || chat[i].is_user) continue;
+                const fp = messageUpdateFingerprint(chat[i], i);
+                if (fp) st.processed.add(fp);
+            }
+            st.baselined = true;
+        } catch (e) {}
+    }
+    async function applyPendingMessageUpdateBlocks() {
+        const session = captureRuntimeSession();
+        const chatKey = autoInitChatId();
+        const greetingState = greetingInitState(chatKey);
+        const st = messageUpdateState(chatKey);
+        if (!greetingState.ready || !st.baselined || st.running) return;
+        st.running = true;
+        try {
+            const ctx = getContextSafe();
+            const chat = Array.isArray(ctx.chat) ? ctx.chat : [];
+            if (ctx.generating === true || ctx.isStreaming === true) return;
+            // 首楼由 applyActiveGreetingInitvar 合并为一次初始化；这里只处理后续楼层。
+            for (let i = 1; i < chat.length; i++) {
+                if (!isRuntimeSessionCurrent(session)) break;
+                const message = chat[i];
+                if (!message || message.is_user || message.is_system || message.role === 'user' || message.role === 'system' ||
+                    String(message.name || '') === 'System' || mvuMessageWrites.has(message)) continue;
+                const fp = messageUpdateFingerprint(message, i);
+                if (!fp || st.processed.has(fp) || st.pending.has(fp)) continue;
+                // 任务不能只绑定聊天：删除、编辑或切换来源消息后，旧更新块也必须失效。
+                // 同一守卫贯穿事件 await、合并窗口、重试以及每次实际数据库调用。
+                const messageSession = bindWriteTarget(captureRuntimeSession(() => {
+                    const currentChat = getContextSafe().chat;
+                    return Array.isArray(currentChat) && currentChat[i] === message &&
+                        messageUpdateFingerprint(message, i) === fp;
+                }));
+                messageSession.messageUpdate = true;
+                messageSession.businessEventEmitted = true;
+                const text = String(message.mes != null ? message.mes : (message.message || ''));
+                st.pending.add(fp);
+                messageUpdatesInProgress.add(message);
+                const swipe = Number(message.swipe_id || 0);
+                let settled = false;
+                try {
+                    const current = window.getAllVariables ? window.getAllVariables() : { stat_data: {}, display_data: {}, delta_data: {} };
+                    const nextWrap = await runMvuUpdateCycle(text, current);
+                    assertRuntimeSession(messageSession);
+                    const updateContext = { variables: nextWrap, message_content: text };
+                    await emitMvuEvent('mag_before_message_update', updateContext);
+                    assertRuntimeSession(messageSession);
+                    const finalWrap = updateContext.variables || nextWrap;
+                    const beforeJson = JSON.stringify(current.stat_data || {});
+                    const afterJson = JSON.stringify((finalWrap && finalWrap.stat_data) || {});
+                    if (beforeJson === afterJson) {
+                        settled = true;
+                    } else {
+                        settled = await new Promise((resolve) => {
+                            scheduleWindowStatOverlay(finalWrap.stat_data || {}, (ok) => resolve(!!ok), false, false, chatKey, messageSession);
+                        });
+                    }
+                    if (settled && isRuntimeSessionCurrent(messageSession)) {
+                        scheduleMvuMessageWrite(message, i, text, updateContext.message_content, swipe, () => {
+                            const rewrittenFp = messageUpdateFingerprint(message, i);
+                            if (rewrittenFp) st.processed.add(rewrittenFp);
+                        });
+                    }
+                } catch (e) {
+                    dbgWarn('[消息更新块] 第 ' + i + ' 楼执行失败:', e);
+                }
+                messageUpdatesInProgress.delete(message);
+                st.pending.delete(fp);
+                if (settled) st.processed.add(fp);
+                else break; // 数据库尚未落定，保留后续顺序并等待下次事件重试
+            }
+        } finally {
+            st.running = false;
+        }
+    }
+
+    // 前端开场白用 setChatMessages/setChatMessage 切换分支时，可能不触发 MESSAGE_SWIPED。
+    // 包一层这两个接口：首楼内容变化后自动按新分支注入初始化（applyActiveGreetingInitvar
+    // 用内容指纹去重，重复触发无副作用）。
+    let greetingWatcherInstalled = false;
+    function installGreetingSwipeWatcher() {
+        if (greetingWatcherInstalled) return;
+        greetingWatcherInstalled = true;
+        const wrap = (orig, host, key) => {
+            if (typeof orig !== 'function') return orig;
+            if (orig.__mvu2ledgerWrapped) return orig;
+            const wrapped = async function (...args) {
+                try { return await orig.apply(host || this, args); }
+                finally {
+                    hostWindow.setTimeout(applyActiveGreetingInitvar, 250);
+                    hostWindow.setTimeout(applyPendingMessageUpdateBlocks, 500);
+                }
+            };
+            try { wrapped.__mvu2ledgerWrapped = true; } catch (e) {}
+            return wrapped;
+        };
+        try {
+            const ctx = getContextSafe();
+            if (ctx && typeof ctx.setChatMessages === 'function') {
+                ctx.setChatMessages = wrap(ctx.setChatMessages, ctx, 'setChatMessages');
+            }
+        } catch (e) {}
+        try {
+            const ctx = getContextSafe();
+            if (ctx && typeof ctx.setChatMessage === 'function') {
+                ctx.setChatMessage = wrap(ctx.setChatMessage, ctx, 'setChatMessage');
+            }
+        } catch (e) {}
+        for (const w of [window, hostWindow]) {
+            try {
+                if (w && typeof w.setChatMessages === 'function') w.setChatMessages = wrap(w.setChatMessages, w, 'setChatMessages');
+            } catch (e) {}
+            try {
+                if (w && typeof w.setChatMessage === 'function') w.setChatMessage = wrap(w.setChatMessage, w, 'setChatMessage');
+            } catch (e) {}
+        }
+    }
+
+    // 兜底：前端开场白可能在任何 iframe/窗口里改写首楼（不一定走我们包装的 setChatMessages）。
+    // 轻量轮询首楼 <initvar> 内容指纹，变化即重新注入（applyActiveGreetingInitvar 幂等）。
+    let greetingPollTimer = null;
+    function startGreetingInitvarPoll() {
+        if (greetingPollTimer) return;
+        greetingPollTimer = hostWindow.setInterval(() => {
+            try {
+                pruneOpeningContinuityStates();
+                if (!activeLayout) return;
+                applyActiveGreetingInitvar();
+            } catch (e) {}
+        }, 2000);
+    }
+
+    function bindAutoInit(context) {
+        worldbookRequestFilter.bind(context);
+        installGreetingSwipeWatcher();
+        const es = context && (context.eventSource || context.event_source);
+        const et = context && (context.event_types || context.eventTypes);
+        if (!es || !et || typeof es.on !== 'function') return;
+        try {
+            if (!autoInitState.inited) {
+                if (et.CHAT_CREATED) es.on(et.CHAT_CREATED, async () => {
+                    // A database seed is already a checkpoint by the time ST emits
+                    // CHAT_CREATED. The explicit lifecycle event, rather than the
+                    // stored values or chat length, identifies unfinished new-chat
+                    // initialization. Existing chats never take this path.
+                    if (!(readCardApiMetadata().schemaKeys || []).length) return;
+                    const state = greetingInitState(autoInitChatId());
+                    if (state.created) return;
+                    state.created = true;
+                    if (state.schemaInitialized) return;
+                    state.baselineNext = false;
+                    state.appliedFp = '';
+                    state.appliedSourceFp = '';
+                    await autoInitDatabase();
+                    await applyActiveGreetingInitvar();
+                });
+                es.on(et.CHAT_CHANGED, () => {
+                    cancelReplyStatusCleanups();
+                    cancelMvuMessageWrites();
+                    const session = captureRuntimeSession();
+                    if (autoInitState.session && !isRuntimeSessionCurrent(autoInitState.session)) {
+                        autoInitState.running = false;
+                        autoInitState.session = null;
+                    }
+                    cancelChatMutationFrontendSync();
+                    autoInitState.retries = 0;
+                    // 上一聊天的待写快照不允许落入新聊天：重试链携带原始 key 会被归属
+                    // 守卫丢弃，但 150ms 合并窗口内的 pending 状态与挂起的 flush Promise
+                    // 也要一并作废，前端 getMvuData 不再读到旧聊天快照。
+                    try {
+                        if (pendingStatWriteSession && !isRuntimeSessionCurrent(pendingStatWriteSession)) {
+                            discardPendingStatWrite();
+                        }
+                    } catch (e) {}
+                    hostWindow.setTimeout(autoInitDatabase, 600);
+                    // 刷新/重进/切聊天后：前端可能已读旧数据，而插件加载完成不主动通知前端；
+                    // 等数据就绪后派发 VARIABLE_INITIALIZED（前端会重读 userData）+
+                    // VARIABLE_UPDATE_ENDED（刷新时钟），覆盖插件异步加载时序。
+                    // 每次进入/切换聊天重置指纹：状态栏 iframe 会重建并先读一次（可能赶上
+                    // 插件回放窗口读到空），若数据与上次进入相同且指纹不清零，这次进入将
+                    // 不再广播、前端永远停在空读。重置后本进入内首次真实数据必广播一次，
+                    // 同一次进入内的多次 scheduleDataReadyNotify 调用仍靠指纹去重（不刷屏）。
+                    // 防抖：同一聊天 5 秒内的重复 CHAT_CHANGED（第三方/卡脚本误触发假切换）
+                    // 不再重置指纹——否则每次假切换都重发重读通知 → 状态栏反复重渲染（一直刷）。
+                    let chatIdNow2 = '';
+                    try { chatIdNow2 = autoInitChatId(); } catch (e) {}
+                    const chatChangedAt = Date.now();
+                    if (lastNotifyResetChat !== chatIdNow2 || chatChangedAt - lastNotifyResetAt > 5000) {
+                        reentryNotifyFingerprint = '';
+                        lastNotifyResetChat = chatIdNow2;
+                        lastNotifyResetAt = chatChangedAt;
+                    }
+                    scheduleDataReadyNotify();
+                    // 切卡后按新卡同步运行时：转换卡接管，其他卡撤销，确保不影响别的卡
+                    syncRuntimeForCurrentCard();
+                    activePlaceholderNeeded = detectPlaceholderFor(currentCharacter());
+                    hostWindow.setTimeout(ensureWindowStatusPlaceholder, 1200);
+                    const p = hostDocument.getElementById(PANEL_ID);
+                    if (p) populateMergeSource(p);
+                });
+                es.on(et.MESSAGE_RECEIVED, messageId => {
+                    scheduleReplyStatusCleanup(messageId);
+                    hostWindow.setTimeout(autoInitDatabase, 600);
+                    hostWindow.setTimeout(applyPendingMessageUpdateBlocks, 900);
+                    scheduleOpeningContinuityRecovery('MESSAGE_RECEIVED');
+                    scheduleChatMutationFrontendSync(et.MESSAGE_RECEIVED);
+                    // 复刻 MVU：AI 回复后追加状态栏占位符。稍后执行，让卡内
+                    // MESSAGE_RECEIVED 动态正则先完成注册/重载；否则此处 setChatMessages
+                    // 会与 Ticket/<ellia> 等首次显示正则竞争，把原始标签重新渲染出来。
+                    hostWindow.setTimeout(ensureWindowStatusPlaceholder, 1200);
+                });
+                if (et.MESSAGE_SENT && typeof et.MESSAGE_SENT === 'string') {
+                    es.on(et.MESSAGE_SENT, () => {
+                        // 用户楼也可能承载插件持久化帧，或触发卡内脚本改表；普通 API
+                        // 回调仍是主通道，这里只负责回调缺失时的前后快照兜底。
+                        scheduleChatMutationFrontendSync(et.MESSAGE_SENT);
+                    });
+                }
+                // 开场白切换/首楼换 swipe：只补建表/占位符（锚点由插件自身管理）
+                for (const evName of [et.MESSAGE_SWIPED, et.MESSAGE_UPDATED, et.MESSAGE_EDITED]) {
+                    if (evName && typeof evName === 'string') {
+                        es.on(evName, () => {
+                            hostWindow.setTimeout(autoInitDatabase, 300);
+                            hostWindow.setTimeout(applyActiveGreetingInitvar, 1200);
+                            hostWindow.setTimeout(applyPendingMessageUpdateBlocks, 1500);
+                            scheduleOpeningContinuityRecovery(evName);
+                            scheduleChatMutationFrontendSync(evName, evName === et.MESSAGE_SWIPED);
+                        });
+                    }
+                }
+                if (et.MESSAGE_DELETED && typeof et.MESSAGE_DELETED === 'string') {
+                    es.on(et.MESSAGE_DELETED, () => {
+                        // 删楼会改变写入基线与承载楼，旧合并窗口中的写入全部取消。
+                        if (pendingStatWriteSession) discardPendingStatWrite();
+                        scheduleOpeningContinuityRecovery(et.MESSAGE_DELETED);
+                        // 删楼不是普通 CRUD，而是 SP 按剩余聊天历史异步回放表格。
+                        // 部分 SP 版本/重载时序不会把这次变化可靠送到外部回调，独立等待
+                        // 回放后的完整快照并补发，不能在删除事件到达时读取旧运行时。
+                        scheduleChatMutationFrontendSync(et.MESSAGE_DELETED, true);
+                    });
+                }
+                if (et.GENERATION_ENDED) {
+                    es.on(et.GENERATION_ENDED, () => {
+                        for (const job of replyStatusCleanups.values()) armReplyStatusCleanup(job);
+                        for (const job of mvuMessageWrites.values()) armMvuMessageWrite(job);
+                        hostWindow.setTimeout(ensureWindowStatusPlaceholder, 1200);
+                        hostWindow.setTimeout(autoInitDatabase, 100);
+                        hostWindow.setTimeout(applyPendingMessageUpdateBlocks, 300);
+                        // 某些卡的 /cut 与生成启动紧邻，删除事件的恢复任务可能仍在排队。
+                        // 先做最后一次连续性检查，待恢复进入执行阶段后再解除保护。
+                        const endingChatKey = autoInitChatId();
+                        scheduleOpeningContinuityRecovery('GENERATION_ENDED');
+                        scheduleChatMutationFrontendSync(et.GENERATION_ENDED);
+                        hostWindow.setTimeout(() => {
+                            try {
+                                const endingState = openingContinuityState(endingChatKey);
+                                if (endingState.recovering) {
+                                    hostWindow.setTimeout(() => disarmOpeningContinuity(endingChatKey), 1200);
+                                } else {
+                                    disarmOpeningContinuity(endingChatKey);
+                                }
+                            } catch (e) {}
+                        }, 1200);
+                    });
+                }
+                autoInitState.inited = true;
+            }
+        } catch (e) {}
+    }
+
+    function getHostWindow(...args) { return stAdapter.getHostWindow(...args); }
+    const hostWindow = getHostWindow();
+    const hostDocument = hostWindow.document || document;
+    // 扩展是唯一运行时 owner。新卡内桥只把卡级模板/layout 注册到这里，
+    // 不再自行安装第二套 Mvu、事件和写库状态机。
+    const runtimeRegistry = (() => {
+        let existing = null;
+        try { existing = hostWindow.__mvu2ledgerRuntime; } catch (e) {}
+        try { if (existing && existing.worldbookRequestFilter) existing.worldbookRequestFilter.stop(); } catch (e) {}
+        try { if (existing && existing.cancelReplyStatusCleanups) existing.cancelReplyStatusCleanups(); } catch (e) {}
+        try { if (existing && existing.cancelMvuMessageWrites) existing.cancelMvuMessageWrites(); } catch (e) {}
+        const pending = existing && Array.isArray(existing.pending) ? existing.pending.slice() : [];
+        const reg = {
+            owner: 'extension',
+            version: (window.MVU2LEDGER_CORE && window.MVU2LEDGER_CORE.VERSION) || 'unknown',
+            pending,
+            _handler: null,
+            registerCard(payload) {
+                if (!payload || typeof payload !== 'object') return false;
+                if (typeof reg._handler === 'function') return !!reg._handler(payload);
+                const sig = String(payload.cardName || '') + '|' + String(payload.cardAvatar || '') + '|' + String(payload.bridgeVersion || '');
+                if (!reg.pending.some(p => p && p.__sig === sig)) {
+                    try { Object.defineProperty(payload, '__sig', { value: sig, enumerable: false }); } catch (e) { payload.__sig = sig; }
+                    reg.pending.push(payload);
+                }
+                return true;
+            },
+        };
+        try { hostWindow.__mvu2ledgerRuntime = reg; } catch (e) {}
+        try { window.__mvu2ledgerRuntime = reg; } catch (e) {}
+        // 先同步封住旧桥的新调用、撤销旧全局，再等待已发出的宿主调用结束。
+        // 在等待期间新薄桥仍可排队，但扩展尚不安装自己的事件和写入入口。
+        const bridges = Array.isArray(hostWindow.__mvu2ledgerLegacyBridges)
+            ? hostWindow.__mvu2ledgerLegacyBridges.splice(0) : [];
+        const draining = [];
+        for (const bridge of bridges) {
+            if (!bridge || typeof bridge.stop !== 'function') continue;
+            try {
+                draining.push(Promise.resolve(bridge.stop()));
+                reg.registerCard(bridge.payload);
+            } catch (error) { draining.push(Promise.reject(error)); }
+        }
+        reg.ready = draining.length ? Promise.all(draining) : null;
+        return reg;
+    })();
+
+    function getContextSafe(...args) { return stAdapter.getContextSafe(...args); }
+    const worldbookRequestFilter = window.MVU2LEDGER_CORE.getWorldbookRequestFilterFactory()({
+        readCharacter: currentCharacter, readExtensions: charExtensions, readWorldbook: charWorldBook,
+    });
+    runtimeRegistry.worldbookRequestFilter = worldbookRequestFilter;
+    runtimeRegistry.cancelReplyStatusCleanups = cancelReplyStatusCleanups;
+    runtimeRegistry.cancelMvuMessageWrites = cancelMvuMessageWrites;
+
+    function resolveRuntimeLayout(rawLayout) {
+        const parsed = typeof rawLayout === 'string'
+            ? JSON.parse(rawLayout)
+            : JSON.parse(JSON.stringify(Array.isArray(rawLayout) ? rawLayout : []));
+        const core = window.MVU2LEDGER_CORE;
+        try {
+            const context = getContextSafe();
+            if (core && typeof core.resolveLayoutMacros === 'function' && context && typeof context.substituteParams === 'function') {
+                return core.resolveLayoutMacros(parsed, context.substituteParams.bind(context));
+            }
+        } catch (e) {
+            dbgWarn(' 解析 layout 运行时宏失败，暂用原逻辑路径:', e && e.message ? e.message : e);
+        }
+        return parsed;
+    }
+
+    // 查找 SP·数据库 插件暴露的 window.AutoCardUpdaterAPI（兼容 iframe/顶层窗口）
+    const ledgerAdapters = new WeakMap();
+    function getAcuApi() {
+        for (const host of [window, window.parent, window.top]) {
+            try {
+                const ledger = host?.SeseLedgerAPI;
+                if (!ledger?.__legacyFace || !ledger.runtime?.isReady()) continue;
+                if (!ledgerAdapters.has(ledger)) ledgerAdapters.set(ledger, window.__MVU2LEDGER_LEDGER_HOST_FACTORY__(ledger, getContextSafe));
+                return ledgerAdapters.get(ledger);
+            } catch (error) { dbgWarn(error.message); }
+        }
+        return null;
+    }
+
+    function getSettings() {
+        const context = getContextSafe();
+        if (!context.extensionSettings) context.extensionSettings = {};
+        if (!context.extensionSettings[SETTINGS_KEY]) {
+            context.extensionSettings[SETTINGS_KEY] = {
+                mode: 'native',
+                installMvuShim: 'auto',
+                translateSimpleEjs: false,
+                appendPlaceholder: true,
+                asPng: 'auto',
+                ddlIncludeCheck: true,
+                jsonContainers: false,
+                translateSimpleEjs: false,
+                debug: false,
+            };
+        }
+        const settings = context.extensionSettings[SETTINGS_KEY];
+        if (!settings.conversionProfiles || typeof settings.conversionProfiles !== 'object' || Array.isArray(settings.conversionProfiles)) {
+            settings.conversionProfiles = {};
+        }
+        return settings;
+    }
+
+    function saveSettings() {
+        try {
+            const context = getContextSafe();
+            if (typeof context.saveSettingsDebounced === 'function') context.saveSettingsDebounced();
+            else if (typeof context.saveSettings === 'function') context.saveSettings();
+        } catch (e) {}
+    }
+
+    function toast(message, type) {
+        try {
+            if (hostWindow.toastr && typeof hostWindow.toastr[type || 'info'] === 'function') {
+                hostWindow.toastr[type || 'info'](message, 'MVU转台账');
+                return;
+            }
+        } catch (e) {}
+        console.log('[mvu2ledger][' + (type || 'info') + ']', message);
+    }
+
+    function download(name, mime, data) {
+        let blob;
+        if (typeof data === 'string') blob = new Blob([data], { type: mime });
+        else blob = new Blob([data], { type: mime });
+        const url = URL.createObjectURL(blob);
+        const a = hostDocument.createElement('a');
+        a.href = url;
+        a.download = name;
+        hostDocument.body.appendChild(a);
+        a.click();
+        hostDocument.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 2000);
+    }
+
+    function currentCharacter(...args) { return stAdapter.currentCharacter(...args); }
+
+    function characterOptionKey(ch) {
+        if (!ch) return '';
+        return String(ch.avatar || (ch.data && ch.data.avatar) || '') + '|' + characterDisplayName(ch);
+    }
+
+    function currentCharacterListFingerprint(context) {
+        const chars = context && Array.isArray(context.characters) ? context.characters : [];
+        return chars.map(characterOptionKey).join('\n');
+    }
+
+    function populateCharacterSelect(panel) {
+        const sel = panel.querySelector('#mvu2ledger-char-select');
+        if (!sel) return;
+        const context = getContextSafe();
+        const chars = Array.isArray(context.characters) ? context.characters : [];
+        const currentIdx = context.characterId != null ? context.characterId : -1;
+        const prevValue = sel.value;
+        const previousChars = Array.isArray(panel.__mvu2ledgerChars) ? panel.__mvu2ledgerChars : [];
+        const previousCharacter = prevValue !== '' && prevValue !== '-1' ? previousChars[Number(prevValue)] : null;
+        const previousKey = characterOptionKey(previousCharacter);
+        panel.__mvu2ledgerChars = chars;
+        panel.__mvu2ledgerCurrentIdx = currentIdx;
+        characterListFingerprint = currentCharacterListFingerprint(context);
+        const searchBox = panel.querySelector('#mvu2ledger-char-search');
+        const keyword = searchBox ? String(searchBox.value || '').trim().toLowerCase() : '';
+        sel.innerHTML = '';
+        const filtered = keyword
+            ? chars.map((ch, i) => ({ ch, i })).filter(({ ch }) => String(ch && ch.name || '').toLowerCase().includes(keyword))
+            : chars.map((ch, i) => ({ ch, i }));
+        if (!filtered.length) {
+            const opt = hostDocument.createElement('option');
+            opt.value = '-1';
+            opt.textContent = keyword ? '（无匹配角色）' : '（角色列表为空）';
+            sel.appendChild(opt);
+            return;
+        }
+        filtered.forEach(({ ch, i }) => {
+            const opt = hostDocument.createElement('option');
+            opt.value = String(i);
+            opt.textContent = (ch && ch.name) ? ch.name : ('角色 ' + i);
+            sel.appendChild(opt);
+        });
+        // 列表增删会改变数组下标：按 avatar+名称保留原选择，不按旧下标误选其他卡。
+        const same = previousKey ? filtered.find(f => characterOptionKey(f.ch) === previousKey) : null;
+        if (same) sel.value = String(same.i);
+        else if (currentIdx >= 0 && filtered.some(f => f.i === currentIdx)) sel.value = String(currentIdx);
+        else if (filtered.length) sel.value = String(filtered[0].i);
+    }
+
+    function startCharacterListRefresh(panel) {
+        if (characterRefreshTimer) return;
+        const tick = () => {
+            characterRefreshTimer = null;
+            try {
+                if (!hostDocument.getElementById(PANEL_ID)) return;
+                const context = getContextSafe();
+                const next = currentCharacterListFingerprint(context);
+                if (next !== characterListFingerprint) populateCharacterSelect(panel);
+            } catch (e) {}
+            characterRefreshTimer = hostWindow.setTimeout(tick, 2500);
+        };
+        characterRefreshTimer = hostWindow.setTimeout(tick, 2500);
+    }
+
+    function selectedCharacter(panel) {
+        const sel = panel && panel.querySelector('#mvu2ledger-char-select');
+        if (sel && sel.value !== '' && sel.value !== '-1') {
+            const idx = Number(sel.value);
+            const context = getContextSafe();
+            if (context.characters && context.characters[idx]) return context.characters[idx];
+        }
+        return currentCharacter();
+    }
+
+    // 酒馆开启 lazyLoadCharacters 时，角色列表对象只有元数据（无世界书）。
+    // 通过 /api/characters/get 按头像取完整卡数据。
+    async function fetchFullCharacter(character, force = false, diagnostic = null) {
+        if (diagnostic) diagnostic.reason = '';
+        if (!character) return null;
+        const cb = charWorldBook(character);
+        // 非强制时：角色对象已有世界书即视为完整，避免无谓请求
+        if (!force && cb && Array.isArray(cb.entries) && cb.entries.length) return character;
+        dbg('按完整卡校验转换标记' + (force ? '（角色列表对象缺 extensions）' : '（缺世界书）') + '，尝试 /api/characters/get 取完整卡。avatar=', character.avatar, 'name=', character && character.name);
+        try {
+            const context = getContextSafe();
+            const headers = typeof context.getRequestHeaders === 'function' ? context.getRequestHeaders() : {};
+            const res = await fetch('/api/characters/get', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ avatar_url: character.avatar }),
+            });
+                dbg('/api/characters/get 状态:', res.status);
+            if (res.ok) {
+                const full = await res.json();
+                const target = full && full.data && typeof full.data.name === 'string' ? full.data : full;
+                dbg('完整卡对象 keys:', Object.keys(full || {}).join(','), '| character_book.entries=', target && target.character_book && Array.isArray(target.character_book.entries) ? target.character_book.entries.length : 'N/A');
+                // 世界书为空不代表卡不完整：初始化可能全部位于问候语。同时保留列表
+                // 对象的身份，不能把 full.data 缺 avatar 转化为全局“按同名匹配”。
+                if (target && typeof target.name === 'string' &&
+                    (typeof target.first_mes === 'string' || (target.character_book && Array.isArray(target.character_book.entries) && target.character_book.entries.length))) {
+                    return Object.assign({}, target, { avatar: character.avatar || (full && full.avatar) || target.avatar || '' });
+                }
+                if (diagnostic) diagnostic.reason = '完整卡接口返回了不含角色数据的对象';
+                // 接口返回了异常对象（如 {mode,baseHash,nextHash,ops} 哈希差异、空对象等），
+                // 不能当作“完整卡”，否则会把本转换器产物误判为非转换卡而跳过建表。
+                // 返回 null 让调用方区分“获取失败（可重试）”与“确实非转换卡”。
+                dbgWarn('/api/characters/get 响应缺少角色卡结构（keys=' + Object.keys(full || {}).join(',') + '），本次视为获取失败，稍后可重试。');
+                return null;
+            }
+            if (diagnostic) diagnostic.reason = '完整卡读取失败（HTTP ' + res.status + '）';
+        } catch (e) {
+            if (diagnostic) diagnostic.reason = '完整卡读取异常：' + (e && e.message ? e.message : e);
+        }
+        // 请求失败也返回 null：调用方需要明确“没拿到完整卡”，不能把它当非转换卡处理
+        return null;
+    }
+
+    function readFileAsBytes(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(new Uint8Array(reader.result));
+            reader.onerror = reject;
+            reader.readAsArrayBuffer(file);
+        });
+    }
+
+    let lastResult = null;
+    let lastInput = null;
+    const mergeState = { sourceTemplate: null, source: '', appliedRefs: [] };
+    let activeProfileName = '';
+    let activeProfileAppliedToLastResult = false;
+    let characterListFingerprint = '';
+    let characterRefreshTimer = null;
+    let activeLayout = null;
+    // activeLayout 归属的卡（卡名|头像）：切卡空窗期用旧卡布局读新卡表格会产生错形状数据，
+    // 读路径与写路径都以它为门槛，布局未就绪时返回空/重试
+    let activeLayoutCardKey = '';
+    let activeCardApiMetadata = {};
+    // 当前卡是否依赖 <StatusPlaceHolderImpl/>（前端注入正则）；由扩展本体维护占位符，
+    // 不依赖 tavern_helper 桥是否运行
+    let activePlaceholderNeeded = false;
+
+    function conversionProfiles() {
+        return getSettings().conversionProfiles;
+    }
+
+    function originalResultName(result) {
+        try {
+            const d = result && result.card && (result.card.data || result.card);
+            const marker = d && d.extensions && d.extensions.mvu2ledger;
+            return String(marker && marker.originalName || d && d.name || '角色').replace(/_数据库$/, '').trim() || '角色';
+        } catch (e) { return '角色'; }
+    }
+
+    function populateProfileSelect(panel) {
+        const sel = panel && panel.querySelector('#mvu2ledger-profile-select');
+        if (!sel) return;
+        const profiles = conversionProfiles();
+        const wanted = activeProfileName || sel.value || '';
+        sel.innerHTML = '';
+        const none = hostDocument.createElement('option');
+        none.value = '';
+        none.textContent = '（不使用已有配置）';
+        sel.appendChild(none);
+        Object.keys(profiles).sort((a, b) => a.localeCompare(b, 'zh-CN')).forEach(name => {
+            const opt = hostDocument.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            sel.appendChild(opt);
+        });
+        sel.value = Object.prototype.hasOwnProperty.call(profiles, wanted) ? wanted : '';
+        activeProfileName = sel.value;
+        const del = panel.querySelector('#mvu2ledger-profile-delete');
+        if (del) del.disabled = !activeProfileName;
+    }
+
+    async function readTemplateSource(source) {
+        const sourceValue = typeof source === 'string' ? source : String(source && source.value || '');
+        const api = getAcuApi();
+        if (!api || typeof api.getTableTemplate !== 'function') return null;
+        if (sourceValue === 'default') {
+            try {
+                const res = await fetch('/TavernDB_template_默认模板.json');
+                if (res.ok) {
+                    const tpl = await res.json();
+                    return tpl && typeof tpl === 'object' ? tpl : null;
+                }
+            } catch (e) {}
+            return null;
+        }
+        let scope = sourceValue === 'chat' ? 'chat' : 'global';
+        let presetName = '';
+        if (sourceValue.indexOf('preset:') === 0) presetName = sourceValue.slice(7);
+        try { return api.getTableTemplate({ scope, presetName }) || null; } catch (e) { return null; }
+    }
+
+    function captureConversionProfile(name) {
+        return conversionProfileTools.captureProfile({
+            name, result: lastResult, appliedRefs: mergeState.appliedRefs, updatedAt: new Date().toISOString(),
+        });
+    }
+
+    async function autoSaveConversionProfile() {
+        if (!lastResult) return false;
+        const profiles = conversionProfiles();
+        // 选中了配置但本次匹配校验被用户拒绝时，绝不覆盖该配置。
+        let name = activeProfileAppliedToLastResult ? activeProfileName : '';
+        if (!name) {
+            name = originalResultName(lastResult);
+            if (Object.prototype.hasOwnProperty.call(profiles, name)) {
+                const replace = hostWindow.confirm('已存在同名转换配置「' + name + '」。\n\n确定：替换已有配置\n取消：重命名后保存');
+                if (!replace) {
+                    let suggested = name + ' (2)';
+                    let n = 2;
+                    while (Object.prototype.hasOwnProperty.call(profiles, suggested)) suggested = name + ' (' + (++n) + ')';
+                    const renamed = hostWindow.prompt('请输入新的配置名称：', suggested);
+                    if (renamed === null) return false;
+                    name = String(renamed || '').trim();
+                    if (!name) return false;
+                    if (Object.prototype.hasOwnProperty.call(profiles, name)) {
+                        toast('配置名称仍已存在，本次未保存配置', 'error');
+                        return false;
+                    }
+                }
+            }
+        }
+        const nextProfile = captureConversionProfile(name);
+        const previous = profiles[name];
+        const unchanged = previous && JSON.stringify({
+            tableConfigs: previous.tableConfigs || {},
+            externalTables: previous.externalTables || [],
+        }) === JSON.stringify({
+            tableConfigs: nextProfile.tableConfigs,
+            externalTables: nextProfile.externalTables,
+        });
+        if (unchanged) {
+            activeProfileName = name;
+            activeProfileAppliedToLastResult = true;
+            populateProfileSelect(hostDocument.getElementById(PANEL_ID));
+            return true;
+        }
+        profiles[name] = nextProfile;
+        activeProfileName = name;
+        activeProfileAppliedToLastResult = true;
+        saveSettings();
+        populateProfileSelect(hostDocument.getElementById(PANEL_ID));
+        toast('已自动保存转换配置：' + name, 'success');
+        return true;
+    }
+
+    async function applySelectedProfile(template) {
+        if (!activeProfileName) return { template, notes: [], applied: false, summary: '' };
+        const profile = conversionProfiles()[activeProfileName];
+        if (!profile) return { template, notes: [], applied: false, summary: '' };
+        const plan = await conversionProfileTools.planProfile({ template, profile, name: activeProfileName });
+        if (plan.needsConfirm) {
+            const accepted = hostWindow.confirm(
+                '所选转换配置与本次结果可能不完全匹配：\n\n' +
+                plan.summary +
+                (plan.notes.length ? '\n\n' + plan.notes.join('\n') : '') +
+                '\n\n确定：仍应用可匹配部分\n取消：本次不使用该配置'
+            );
+            if (!accepted) {
+                mergeState.appliedRefs = [];
+                return { template: plan.baseTemplate, notes: ['用户已取消应用所选配置。'], applied: false, summary: plan.summary };
+            }
+        }
+        mergeState.appliedRefs = plan.refs;
+        return { template: plan.template, notes: plan.notes, applied: true, summary: plan.summary };
+    }
+    function acceptBridgeRegistration(payload) {
+        try {
+            if (!payload || typeof payload !== 'object') return false;
+            const ch = currentCharacter();
+            if (!ch || !isConvertedMvuCard(ch)) return false;
+            const ext = charExtensions(ch) || {};
+            const marker = ext.mvu2ledger || {};
+            const currentName = String(ch.name || (ch.data && ch.data.name) || '');
+            const payloadName = String(payload.cardName || '');
+            const originalName = String(marker.originalName || '');
+            if (!payloadName || (payloadName !== currentName && payloadName !== originalName)) {
+                dbgWarn('[运行时注册] 忽略非当前卡桥 payload：' + payloadName + '（当前=' + currentName + '）');
+                return false;
+            }
+            const parseLayout = value => typeof value === 'string' ? JSON.parse(value) : value;
+            const payloadLayout = parseLayout(payload.layout);
+            const currentLayout = parseLayout(marker.layout);
+            if (!Array.isArray(payloadLayout) || !Array.isArray(currentLayout)) return false;
+            // 注册只验证当前卡自己的数据，不允许旧 iframe 把任意布局绑定为当前卡。
+            if (JSON.stringify(payloadLayout) !== JSON.stringify(currentLayout)) return false;
+            if (payload.convertedAt && String(payload.convertedAt) !== String(marker.convertedAt || '')) return false;
+            const cb = charWorldBook(ch);
+            const templateEntry = cb && Array.isArray(cb.entries) && cb.entries.find(e => Array.isArray(e.keys) && e.keys.indexOf(DB_TEMPLATE_KEY) >= 0);
+            if (templateEntry && String(templateEntry.content || '') !== String(payload.templateBase64 || '')) return false;
+            // 旧桥没有转换标识，必须由当前卡的模板数据佐证；仅名字相同不足以接管。
+            if (!payload.convertedAt && !templateEntry) return false;
+            activeLayout = resolveRuntimeLayout(currentLayout);
+            activeCardApiMetadata = marker;
+            activeLayoutCardKey = cardCacheKey(ch);
+            activePlaceholderNeeded = !!payload.statusPlaceholderNeeded;
+            if (payload.templateBase64) {
+                const holder = (typeof window !== 'undefined' ? window : globalThis);
+                holder.__mvu2ledgerTemplateCache = JSON.parse(mvu2ledgerDecodeB64(String(payload.templateBase64)));
+                holder.__mvu2ledgerTemplateCacheFor = activeLayoutCardKey;
+                holder.__mvu2ledgerTemplateCacheForName = currentName;
+            }
+            installWindowGetAllVariables();
+            installWindowMvuShim();
+            ensureTemplateDefine();
+            hostWindow.setTimeout(autoInitDatabase, 0);
+            dbg('[运行时注册] 已接收薄桥 payload，扩展成为唯一 owner：' + currentName);
+            return true;
+        } catch (e) {
+            dbgWarn('[运行时注册] 接收桥 payload 失败:', e && e.message ? e.message : e);
+            return false;
+        }
+    }
+    function activateRuntimeRegistry() {
+        runtimeRegistry._handler = acceptBridgeRegistration;
+        const queued = runtimeRegistry.pending.splice(0, runtimeRegistry.pending.length);
+        for (const payload of queued) acceptBridgeRegistration(payload);
+    }
+    // 重读通知去重：同一份运行时数据只广播一次（数据变化后再次广播）
+    let reentryNotifyFingerprint = '';
+    // 重读通知指纹重置的防抖记录：同一聊天短时间内的重复 CHAT_CHANGED
+    // （第三方扩展/卡内脚本误触发“假切换”）不再重置指纹重发通知，避免状态栏反复重渲染。
+    let lastNotifyResetChat = '';
+    let lastNotifyResetAt = 0;
+    // 最近一次数据库写入时间：写入后 ~1.5s 内运行时可能领先持久化帧，读侧优先信任运行时；
+    // 之后若运行时与持久化帧不一致，视为插件回放未完成/旧值，读侧以持久化帧（数据库真相）为准。
+    let lastDbWriteAt = 0;
+    // Mvu.replaceMvuData 合并写入：MVU 卡开局初始化常连续多次调用（每次只改一个字段），
+    // 每次都触发插件整表持久化；合并为一次后只持久化一次。
+    let pendingStatWrite = null;
+    let pendingStatWriteSession = null;
+    // 写批次串行执行；新快照在防抖窗口合并，不能与仍在 await CRUD 的旧批次并行。
+    let statWriteInFlight = Promise.resolve();
+    let statWriteTimer = null;
+    let statWriteFlushResolve = null;
+    let statWriteFlushPromise = null;
+    let statWriteOverlayGen = 0;
+    let pendingStatWriteIsInitialization = false;
+    // 当前待写快照所属的聊天 key：切聊天时据此作废 pending 写入与挂起的 flush Promise。
+    let pendingStatWriteOriginKey = '';
+    // 模板缓存未就绪时写库重试次数（每次新写入在调度入口重置，避免重试自身把
+    // 计数清零导致无限循环的同时，也不会让一次失败耗尽后续所有写入的预算）
+    let overlayFlushRetries = 0;
+    // 跨卡残留前端写库丢弃的限频标记（按聊天去重，避免刷屏）
+    let lastForeignWriteDropChat = '';
+
+    // 浏览器和 Node 测试使用同一候选构造工厂；构建时已将工厂及其依赖完整内联。
+    // 每次按当前 core 创建无状态构造器，避免模块替换后仍使用旧 core。
+    function buildUpdatedTemplateFromStat(layoutEntries, prevStat, nextStat, baseTemplate) {
+        const coreNow = window.MVU2LEDGER_CORE;
+        if (!coreNow || typeof coreNow.writeStatDiffToDbResult !== 'function' || typeof coreNow.statDataFromTables !== 'function') return null;
+        const factory = window.__MVU2LEDGER_CANDIDATE_BUILDER_FACTORY__;
+        if (typeof factory !== 'function') throw new Error('候选快照构造模块未加载，请使用构建后的 index.js');
+        return factory({ core: coreNow, warn: dbgWarn })
+            .buildUpdatedTemplateFromStat(layoutEntries, prevStat, nextStat, baseTemplate);
+    }
+
+    // 每聊天首次写库已通过 initGameSession 完成“合并注入数据建表”的标记：
+    // 之后该聊天的写库走快照/增量提交，不再重复 initGameSession（避免反复重置表格）。
+    const openingWriteSettledChats = new Set();
+    // 新开局整表初始化快速路径：参考卡（人工重写的 sqlite 版）不会逐格 CRUD，
+    // 而是把所选开局直接构造为完整模板，再调一次 initGameSession 原子建表。
+    // 该路径只在“短聊天 + 首个完整多组写入”时启用，避免覆盖玩家已有进度。
+    const openingBulkUsedChats = new Map();
+    const openingBulkClosedChats = new Set();
+    const OPENING_BULK_MAX_SNAPSHOTS = 4;
+
+    // CHAT_CHANGED 可能晚于新会话第一次调用。入口和事件共用完整清理，
+    // 确保旧调用只得到失败，新调用有独立 Promise，读侧也不残留旧快照。
+    function discardPendingStatWrite() {
+        const resolve = statWriteFlushResolve;
+        pendingStatWrite = null;
+        pendingStatWriteSession = null;
+        pendingStatWriteOriginKey = '';
+        pendingStatWriteIsInitialization = false;
+        statWriteFlushResolve = null;
+        statWriteFlushPromise = null;
+        statWriteOverlayGen += 1;
+        if (statWriteTimer) hostWindow.clearTimeout(statWriteTimer);
+        statWriteTimer = null;
+        const holder = typeof window !== 'undefined' ? window : root;
+        if (holder) holder.__mvu2ledgerPendingStat = null;
+        invalidateStatProjectionCache();
+        if (resolve) resolve(false);
+    }
+
+    // MVU 的原始对象允许省略字段，而数据库会按列类型补齐默认值；两者不能直接
+    // JSON.stringify 比较。整表提交的预期值和实际值必须先经过同一 layout 的
+    // 表格→stat_data 投影，再做键序无关的确定性比较。
+    function canonicalJsonForSync(value) {
+        const walk = (v) => {
+            if (Array.isArray(v)) return v.map(walk);
+            if (!v || typeof v !== 'object') return v;
+            const out = {};
+            for (const key of Object.keys(v).filter(k => k !== '$internal').sort()) out[key] = walk(v[key]);
+            return out;
+        };
+        try { return JSON.stringify(walk(value)); } catch (e) { return ''; }
+    }
+
+    // 已有聊天再做整表 import 时，必须沿用 SP 已分配的 sheet key。
+    // 转换器内嵌模板用紧凑拼音 key（sheet_shijiebiao），SP 初始化
+    // 后通常是分音节 key（sheet_shi_jie_biao）。若 data_replace 直接带回
+    // 前者，V2 会对同一显示表名保留两个身份，下次 SQL 回放必然冲突。
+    function rebindTemplateSheetKeysToRuntime(candidate, runtimeTables) {
+        const src = candidate && typeof candidate === 'object' ? candidate : {};
+        const runtime = runtimeTables && typeof runtimeTables === 'object' ? runtimeTables : {};
+        const runtimeKeyByName = new Map();
+        const duplicateRuntimeNames = new Set();
+        for (const key of Object.keys(runtime)) {
+            if (key.indexOf('sheet_') !== 0 || !runtime[key] || !runtime[key].name) continue;
+            const name = String(runtime[key].name);
+            if (runtimeKeyByName.has(name) && runtimeKeyByName.get(name) !== key) duplicateRuntimeNames.add(name);
+            else runtimeKeyByName.set(name, key);
+        }
+        const out = {};
+        for (const key of Object.keys(src)) {
+            if (key.indexOf('sheet_') !== 0 || !src[key] || !src[key].name) {
+                out[key] = JSON.parse(JSON.stringify(src[key]));
+                continue;
+            }
+            const name = String(src[key].name);
+            const rebound = !duplicateRuntimeNames.has(name) && runtimeKeyByName.has(name)
+                ? runtimeKeyByName.get(name)
+                : key;
+            if (out[rebound] !== undefined) throw new Error('整表导入 key 归并冲突：' + name + ' → ' + rebound);
+            out[rebound] = JSON.parse(JSON.stringify(src[key]));
+        }
+        return out;
+    }
+
+    async function commitMessageUpdateSnapshot(api, prevStat, nextStat, session) {
+        if (canonicalJsonForSync(prevStat) === canonicalJsonForSync(nextStat)) return false;
+        // SP 9.2.5 的手动 CRUD 追加到最近已有表帧的 AI 楼，可能仍是首楼。
+        // 消息更新必须落在当前回复：整表导入由 SP 选择最新 AI 楼并严格保存，
+        // 删除/重生成该回复时，宿主才能连同其更新一起回放撤销。
+        if (typeof api.importTableAsJson !== 'function') throw new Error('消息更新需要数据库整表导入能力');
+        const before = api.exportTableAsJson();
+        const beforeJson = JSON.stringify(before);
+        const candidate = await buildUpdatedTemplateFromStat(activeLayout, prevStat, nextStat, before);
+        assertRuntimeSession(session);
+        if (!candidate) throw new Error('消息更新快照构造失败');
+        if (JSON.stringify(api.exportTableAsJson()) !== beforeJson) throw new Error('消息更新期间数据库已变化，等待重新规划');
+        const imported = await api.importTableAsJson(JSON.stringify(candidate));
+        assertRuntimeSession(session);
+        if (imported !== true && !(imported && imported.success === true)) throw new Error('消息更新快照未提交成功');
+        return true;
+    }
+
+    async function commitCurrentReplyBatch(api, prevStat, nextStat, persistedTables, session, options = {}) {
+        const factory = window.__MVU2LEDGER_CANDIDATE_BUILDER_FACTORY__;
+        if (typeof factory !== 'function') throw new Error('候选快照构造模块未加载');
+        const plan = await factory({ core: window.MVU2LEDGER_CORE, warn: dbgWarn })
+            .planCurrentReplyWrites(api, activeLayout, prevStat, nextStat, persistedTables);
+        assertRuntimeSession(session);
+        if (!plan.operations.length) return false;
+        if (JSON.stringify(api.exportTableAsJson()) !== plan.beforeJson) throw new Error('批次规划期间数据库已变化，等待重新规划');
+        const op = plan.operations[0];
+        if (typeof options.assertBeforeCommit === 'function') options.assertBeforeCommit();
+        if (options.allowImport === false && (plan.operations.length !== 1 || op.method === 'importTableAsJson')) {
+            throw new Error('旧楼业务修正需要多个宿主操作，缺少指定旧楼的原子提交接口；整笔修正未写入');
+        }
+        let result;
+        if (plan.operations.length === 1 && op.method !== 'importTableAsJson') {
+            // 单次 CRUD 保留差量；宿主拒绝后不拆成多次调用，以免破坏同一行的完整性。
+            if (typeof api[op.method] !== 'function') throw new Error('数据库缺少写入能力：' + op.method);
+            result = await api[op.method](...op.args);
+            const failed = op.method === 'insertRow'
+                ? result === false || result === -1 || result == null : !result;
+            if (failed) throw new Error('当前回复单次写入未提交成功');
+        } else {
+            if (typeof api.importTableAsJson !== 'function') throw new Error('当前回复多步写入需要整表导入能力');
+            result = await api.importTableAsJson(JSON.stringify(plan.tables));
+            if (result !== true && !(result && result.success === true)) throw new Error('当前回复批次未提交成功');
+        }
+        assertRuntimeSession(session);
+        return true;
+    }
+
+    async function tryOpeningBulkInit(api, prevStat, nextStat, chatKey, explicitInitialization, originSession) {
+        const session = originSession || captureRuntimeSession();
+        const stateKey = runtimeScopedChatKey(chatKey);
+        try {
+            assertRuntimeSession(session);
+            api = runtimeApiForSession(api, session);
+            // 归属守卫：调用方捕获的 chatKey 与当前聊天不一致时直接放弃（不重试）。
+            // 整表 importTableAsJson/initGameSession 一旦落入切换后的新聊天，会直接
+            // 覆盖其进度；稳定期校验也会因读到新聊天数据而误判失败。
+            try { if (String(chatKey) !== autoInitChatId()) { dbg(' [开局快速路径] 跳过: 聊天已切换'); return false; } } catch (e) {}
+            if (!openingChatIsShort()) {
+                // 切换开场分支时，其他脚本可能正在重载消息，ctx.chat 会短暂呈现
+                // 为旧聊天/过渡态。明确的 initvar 不应因此退回逐格 CRUD；等聊天
+                // 稳定后重试，仍由短聊天门禁防止覆盖已有进度。
+                if (explicitInitialization) {
+                    dbg(' [开局快速路径] 等待: chat_not_short（初始化分支加载过渡态）');
+                    return 'retry';
+                }
+                openingBulkClosedChats.add(stateKey);
+                pruneOrderedCollection(openingBulkClosedChats, 80);
+                dbg(' [开局快速路径] 跳过: chat_not_short');
+                return false;
+            }
+            if (!explicitInitialization && openingBulkClosedChats.has(stateKey)) {
+                dbg(' [开局快速路径] 跳过: init_phase_closed');
+                return false;
+            }
+            const bulkState = openingBulkUsedChats.get(stateKey);
+            if (!explicitInitialization && bulkState && bulkState.count >= OPENING_BULK_MAX_SNAPSHOTS) {
+                openingBulkClosedChats.add(stateKey);
+                pruneOrderedCollection(openingBulkClosedChats, 80);
+                dbg(' [开局快速路径] 跳过: snapshot_limit');
+                return false;
+            }
+            let nextHash = '';
+            try { nextHash = JSON.stringify(nextStat || {}); } catch (e) {}
+            if (bulkState && nextHash && bulkState.lastHash === nextHash) {
+                dbg(' [开局快速路径] 跳过: duplicate_snapshot');
+                return false;
+            }
+            // 标准 <initvar> 由调用方显式标记为初始化；卡作者自行调用 replaceMvuData
+            // 时，仅对整页注入式开局前端启用兜底识别，避免运行期全量替换误重建数据库。
+            const frontendLoaded = !!(typeof window !== 'undefined' && window.__mvu2ledgerFrontendLoaded) ||
+                !!(hostWindow && hostWindow.__mvu2ledgerFrontendLoaded) ||
+                !!(typeof window !== 'undefined' && window.parent && window.parent.__mvu2ledgerFrontendLoaded) ||
+                !!(typeof window !== 'undefined' && window.top && window.top.__mvu2ledgerFrontendLoaded);
+            dbg(' [开局快速路径] 检查: chatShort=' + openingChatIsShort() +
+                ' | explicitInit=' + !!explicitInitialization +
+                ' | phaseCount=' + (bulkState ? bulkState.count : 0) +
+                ' | frontendLoaded=' + frontendLoaded +
+                ' | groups=' + Object.keys(nextStat || {}).filter(k => k !== '$internal').length);
+            if (!explicitInitialization && !frontendLoaded) return false;
+            const groups = Object.keys(nextStat || {}).filter(k => k !== '$internal');
+            if (!explicitInitialization && groups.length < 2) return false;
+            const tpl = cachedTemplateForCurrentCard();
+            const coreNow = window.MVU2LEDGER_CORE;
+            if (!tpl || !coreNow || typeof coreNow.writeStatDiffToDbResult !== 'function') return false;
+            const mergedTemplate = await buildUpdatedTemplateFromStat(activeLayout, prevStat, nextStat, tpl);
+            assertRuntimeSession(session);
+            if (!mergedTemplate) return false;
+            const ch = currentCharacter();
+            const presetName = (characterDisplayName(ch) || '角色') + '模板';
+            // 新聊天缺表才需要 initGameSession。若基础表已经存在（最常见于用户进入聊天后
+            // 再切换开场 swipe），再次 initGameSession 会 reloadCurrentChatUnsafe；保存尚未
+            // 落定时旧 checkpoint 会在重载后覆盖新快照。SP 的 importTableAsJson 默认走
+            // 持久化 data_replace 提交并原子替换运行时，正适合已有会话的完整快照更新。
+            let runtimeHasAllTables = false;
+            let currentRuntimeTables = null;
+            try {
+                currentRuntimeTables = api.exportTableAsJson() || {};
+                const runtimeNames = new Set(Object.keys(currentRuntimeTables)
+                    .filter(k => k.indexOf('sheet_') === 0 && currentRuntimeTables[k] && currentRuntimeTables[k].name)
+                    .map(k => String(currentRuntimeTables[k].name)));
+                const expectedNames = new Set((activeLayout || []).map(L => String(L.table || '')).filter(Boolean));
+                runtimeHasAllTables = expectedNames.size > 0 && [...expectedNames].every(name => runtimeNames.has(name));
+            } catch (e) {}
+            let committedTemplate = mergedTemplate;
+            if (runtimeHasAllTables && typeof api.importTableAsJson === 'function') {
+                committedTemplate = rebindTemplateSheetKeysToRuntime(mergedTemplate, currentRuntimeTables);
+                const imported = await Promise.resolve(api.importTableAsJson(JSON.stringify(committedTemplate)));
+                if (imported === false || (imported && imported.success === false)) {
+                    throw new Error((imported && imported.error) || 'importTableAsJson 持久化替换失败');
+                }
+                dbg(' [开局快速路径] 已有表格，使用 importTableAsJson 原子持久化当前分支（不重载聊天）。');
+            } else {
+                const out = await Promise.resolve(api.initGameSession({}, {
+                    injectTemplate: true,
+                    loadPreset: false,
+                    templateData: mergedTemplate,
+                    templatePresetName: presetName,
+                }));
+                if (out && out.success === false) throw new Error(out.message || 'initGameSession 失败');
+            }
+            const ready = await waitRuntimeTablesReady(api, activeLayout, 5000);
+            assertRuntimeSession(session);
+            if (!ready) throw new Error('数据库运行时未就绪');
+            // importTableAsJson 的 API 成功只表示提交管线没有报错。再从当前
+            // 运行时反向读取 stat_data，防止旧 checkpoint/外部重载立即覆盖后
+            // 仍误报“初始化完成”并向前端广播默认值。
+            const expectedWrap = coreNow.statDataFromTables(activeLayout, committedTemplate);
+            const expectedStat = expectedWrap && expectedWrap.stat_data;
+            const expectedHash = canonicalJsonForSync(expectedStat || {});
+            // importTableAsJson 返回成功后，卡内前端可能紧接着触发
+            // reloadCurrentChatUnsafe。只做一次即时读回会在“新运行时已换上、
+            // 旧聊天即将重载”的窗口误报成功。在短稳定期内同时核对
+            // 运行时与 V2 持久化帧；任一边回退都整份快照重试。
+            const verifyCandidate = function () {
+                const runtimeTables = api.exportTableAsJson() || {};
+                const actualWrap = coreNow.statDataFromTables(activeLayout, runtimeTables);
+                const actualStat = actualWrap && actualWrap.stat_data;
+                const actualHash = canonicalJsonForSync(actualStat || {});
+                let persistedHash = '';
+                try {
+                    // 持久化帧可能在保存/重载中以相同字节长度被替换，
+                    // 校验时必须绕过只读缓存重建当前聊天真值。
+                    persistedReadCache = { key: '', data: null };
+                    const persistedTables = readPersistedTableData();
+                    if (persistedTables) {
+                        const persistedWrap = coreNow.statDataFromTables(activeLayout, persistedTables);
+                        persistedHash = canonicalJsonForSync((persistedWrap && persistedWrap.stat_data) || {});
+                    }
+                } catch (e) {}
+                return {
+                    ok: !!expectedHash && actualHash === expectedHash && (!persistedHash || persistedHash === expectedHash),
+                    actualBytes: actualHash.length,
+                    persistedBytes: persistedHash.length,
+                };
+            };
+            let verification = verifyCandidate();
+            if (verification.ok) {
+                const stableDeadline = Date.now() + 1200;
+                while (Date.now() < stableDeadline) {
+                    await new Promise(resolve => hostWindow.setTimeout(resolve, 300));
+                    assertRuntimeSession(session);
+                    verification = verifyCandidate();
+                    if (!verification.ok) break;
+                }
+            }
+            if (!verification.ok) {
+                dbgWarn(' [开局快速路径] 提交后运行时/持久化快照未稳定达到候选值，等待整体重试（expectedBytes=' + expectedHash.length + ', actualBytes=' + verification.actualBytes + ', persistedBytes=' + verification.persistedBytes + '）。');
+                return 'retry';
+            }
+            try { if (String(chatKey) !== autoInitChatId()) { dbg(' [开局快速路径] 提交后聊天已切换，丢弃本次结果（不记账、不广播）。'); return false; } } catch (e) {}
+            openingBulkUsedChats.set(stateKey, {
+                count: (bulkState ? bulkState.count : 0) + 1,
+                lastAt: Date.now(),
+                lastHash: nextHash,
+            });
+            pruneOrderedCollection(openingBulkUsedChats, 80);
+            return true;
+        } catch (e) {
+            if (!isRuntimeSessionCurrent(session)) return false;
+            dbgWarn(' 开局整表初始化快速路径未落定，延后重试：' + (e && e.message ? e.message : e));
+            return explicitInitialization ? 'retry' : false;
+        }
+    }
+
+    // 对齐参考卡 waitForOpeningDatabase：等待插件把运行时表格就绪（initGameSession/回放
+    // 后的异步物化）。就绪 = 布局内所有表都已出现在 exportTableAsJson（插件已加载结构），
+    // 且每张单例/JSON 表存在数据行（与读侧规格一致：半物化状态下以空 prev 为基线 diff，
+    // 会把整组默认值当差异写进数据库）；模板本身无数据行的表不参与行校验。
+    // 超时未就绪返回 false，调用方延后重试写入。不做任何手工物化。
+    async function waitRuntimeTablesReady(api, layoutEntries, timeoutMs) {
+        const session = captureRuntimeSession();
+        const expected = new Set((Array.isArray(layoutEntries) ? layoutEntries : []).map(L => L.table));
+        if (!expected.size) return true;
+        // 读侧规格（单例/JSON 表必须有数据行，tableSnapshotCoversLayout）在写侧只能作为
+        // 限时快速路径的加强条件：运行时会长期处于“仅表头 + seedRows/持久化帧待物化”
+        // 状态（新聊天 native 初始化、切换开场分支的重载窗口），写路径自身的补行与
+        // 持久化对账守卫才是这种状态下正确性的保障——硬性阻塞行校验会把 initvar 注入
+        // 永久挡在门外（v0.3.1 回归）。行未齐时最多再等 1.5s，超时后退回仅表名校验。
+        const needRows = new Set();
+        for (const L of (Array.isArray(layoutEntries) ? layoutEntries : [])) {
+            if ((L.kind === 'singleton' || L.kind === 'json') && L.table) needRows.add(String(L.table));
+        }
+        try {
+            const tpl = cachedTemplateForCurrentCard();
+            if (tpl) {
+                for (const s of Object.values(tpl)) {
+                    if (s && s.name && (!Array.isArray(s.content) || s.content.length <= 1)) needRows.delete(String(s.name));
+                }
+            }
+        } catch (e) {}
+        const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
+        const rowDeadline = Date.now() + 1500;
+        let missingNames = null;
+        let missingRows = null;
+        while (Date.now() < deadline) {
+            if (!isRuntimeSessionCurrent(session)) return false;
+            try {
+                const cur = api.exportTableAsJson() || {};
+                const byName = {};
+                for (const k in cur) {
+                    if (k.indexOf('sheet_') === 0 && cur[k] && cur[k].name) byName[String(cur[k].name)] = cur[k];
+                }
+                missingNames = [];
+                for (const n of expected) { if (!byName[n]) missingNames.push(n); }
+                if (missingNames.length) {
+                    await new Promise(res => hostWindow.setTimeout(res, 150));
+                    continue;
+                }
+                if (Date.now() >= rowDeadline) return true; // 表名齐全：行等待窗口已过，交由写路径守卫
+                missingRows = [];
+                for (const n of needRows) {
+                    const sheet = byName[n];
+                    if (sheet && (!Array.isArray(sheet.content) || sheet.content.length <= 1)) missingRows.push(n);
+                }
+                if (missingRows.length) {
+                    await new Promise(res => hostWindow.setTimeout(res, 150));
+                    continue;
+                }
+                return true;
+            } catch (e) {
+                await new Promise(res => hostWindow.setTimeout(res, 150));
+            }
+        }
+        if (missingNames && !missingNames.length) {
+            dbg('[流程] 运行时表名齐全但单例/JSON 表缺数据行（' + (missingRows || []).slice(0, 6).join('、') + '），按仅表名就绪放行写路径（由补行/对账守卫兜底）。');
+            return true;
+        }
+        dbg('[流程] 运行时就绪等待超时：缺表=' + (Array.from(missingNames || expected).slice(0, 6).join('、') || '?'));
+        return false;
+    }
+
+    // 合并写入：前端一次操作常连续触发多次 replaceMvuData（如同步资源+追加操作日志），
+    // 短窗口内合并为一次持久化；读路径直接返回待写快照保证写后立即读一致。
+    function scheduleWindowStatOverlay(next, onSettled, isRetry, explicitInitialization, originChatKey, originSession) {
+        // 重试必须携带首次调度时的聊天 key：重试间隔内切换聊天（尤其同卡不同聊天，
+        // 布局归属校验拦不住）后重新捕获新 key，会让旧聊天的快照通过归属守卫写进新聊天。
+        let writeChatKey = '';
+        const sourceSession = originSession || captureRuntimeSession();
+        const requestedSession = explicitInitialization ? sourceSession : bindWriteTarget(sourceSession);
+        const pendingSource = pendingStatWriteSession;
+        const writeSession = pendingSource && pendingSource !== requestedSession && isRuntimeSessionCurrent(pendingSource) && pendingSource.messageUpdate
+            ? { ...requestedSession, messageUpdate: true,
+                validate: () => isRuntimeSessionCurrent(requestedSession) && isRuntimeSessionCurrent(pendingSource) } : requestedSession;
+        if (typeof originChatKey === 'string' && originChatKey) {
+            writeChatKey = originChatKey;
+        } else {
+            try { writeChatKey = autoInitChatId(); } catch (e) {}
+        }
+        if (pendingStatWriteSession && !isRuntimeSessionCurrent(pendingStatWriteSession)) {
+            discardPendingStatWrite();
+        }
+        if (!isRuntimeSessionCurrent(writeSession) || writeChatKey !== autoInitChatId()) {
+            if (typeof onSettled === 'function') onSettled(false);
+            return Promise.resolve(false);
+        }
+        if (!isRetry) {
+            // 每次新写入都有独立的就绪重试预算：此前预算只在 replaceMvuData 入口清零，
+            // <UpdateVariable> 楼层处理等非 Mvu 入口一旦耗尽预算，同聊天后续写入会被永久放弃。
+            overlayFlushRetries = 0;
+        }
+        pendingStatWriteOriginKey = writeChatKey;
+        pendingStatWriteSession = writeSession;
+        invalidateStatProjectionCache();
+        // 合并窗口内的所有 replaceMvuData 共用一个落定 Promise。
+        // 这样卡内脚本的 await Mvu.replaceMvuData(...) 不再只等到“排队”，
+        // 而是等到 CRUD、持久化与 saveChat 真正完成。
+        if (!statWriteFlushPromise) {
+            statWriteFlushPromise = new Promise(resolve => { statWriteFlushResolve = resolve; });
+        }
+        const flushPromise = statWriteFlushPromise;
+        if (!isRetry && typeof onSettled === 'function') {
+            flushPromise.then(ok => { try { onSettled(ok); } catch (e) {} });
+        }
+        statWriteOverlayGen += 1;
+        pendingStatWrite = next;
+        pendingStatWriteIsInitialization = pendingStatWriteIsInitialization || !!explicitInitialization;
+        // 共享给卡内桥/其他窗口的“最新待写状态”：连续 读-改-写 都基于它累积，
+        // 避免 150ms 合并窗口内后写读旧运行时把前写覆盖（成就标记丢失）。
+        try {
+            const ph = (typeof window !== 'undefined' ? window : root);
+            if (ph) ph.__mvu2ledgerPendingStat = next;
+        } catch (e) {}
+        if (statWriteTimer) hostWindow.clearTimeout(statWriteTimer);
+        const scheduledGen = statWriteOverlayGen;
+        const runFlush = async () => {
+            // 排队期间可能被较新的防抖快照或切聊天取消。
+            if (scheduledGen !== statWriteOverlayGen || flushPromise !== statWriteFlushPromise) return;
+            statWriteTimer = null;
+            const target = pendingStatWrite;
+            if (target === null || target === undefined) {
+                pendingStatWriteIsInitialization = false;
+                if (statWriteFlushResolve) {
+                    const resolveFlush = statWriteFlushResolve;
+                    statWriteFlushResolve = null;
+                    statWriteFlushPromise = null;
+                    resolveFlush(false);
+                }
+                return;
+            }
+            const gen = statWriteOverlayGen;
+            const isInitializationWrite = pendingStatWriteIsInitialization;
+            // 标志只描述“当前待写快照”：捕获后立即清零，防止初始化写进入重试链后
+            // 泄漏到后续普通写（显式初始化分支会绕过开局整表的全部保险门禁）。
+            // 重试路径通过 explicitInitialization 参数重新置位。
+            pendingStatWriteIsInitialization = false;
+            const chatKeyNow = autoInitChatId();
+            // settledOk：本次写入是否真正落定（成功或与目标一致）；retryScheduled：
+            // 是否已安排重试（重试会携带同一回调，最终落定时才通知调用方）。
+            let settledOk = false;
+            let nativeWrite = null;
+            let retryScheduled = false;
+            let writeUnsettled = false;
+            try {
+                // 归属校验：150ms 合并窗口内若已切换聊天/角色，丢弃本次待写，
+                // 避免把上一张卡/上一个聊天的数据写进当前会话。
+                let nowChatKey = '';
+                try { nowChatKey = autoInitChatId(); } catch (e) {}
+                if (writeChatKey !== nowChatKey || !isRuntimeSessionCurrent(writeSession)) {
+                    dbgWarn(' Mvu 合并写库被跳过：聊天已切换（' + writeChatKey + ' → ' + nowChatKey + '），丢弃待写快照。');
+                    return;
+                }
+                const api = runtimeApiForSession(getAcuApi(), writeSession);
+                if (api && activeLayout) {
+                    // 插件自己的事务管线负责 checkpoint/落盘；这里只做运行时就绪等待与差异写入。
+                    // 不再手工锚定：initGameSession/插件提交管线自动建立并维护 checkpoint。
+                    
+                    const tplCached = cachedTemplateForCurrentCard();
+                    // 布局归属校验：切卡空窗期 activeLayout 仍是上一张卡的，写库会按错布局落表；
+                    // 与模板缓存一起作为“自动建表就绪”门槛，未就绪时延后重试。
+                    let layoutOk = false;
+                    try { layoutOk = layoutBelongsToCurrentCard(activeLayoutCardKey); } catch (e) {}
+                    if (!tplCached || !layoutOk) {
+                        // 自动建表可能在途（角色列表懒加载需要先取完整卡再缓存模板/布局）：
+                        // 延后重试，避免开局/开场白注入在就绪前被直接丢弃或按旧布局写错。
+                        if (overlayFlushRetries < 6) {
+                            overlayFlushRetries += 1;
+                            dbg('[流程] 模板缓存/布局未就绪' + (tplCached ? '（布局未匹配）' : '') + '，延后重试写库（#' + overlayFlushRetries + '）。');
+                            hostWindow.setTimeout(() => {
+                                // 仅当期间没有更新的写入时才重试，避免旧快照覆盖新状态
+                                if (statWriteOverlayGen === gen) scheduleWindowStatOverlay(target, null, true, isInitializationWrite, writeChatKey, writeSession);
+                            }, 500);
+                            retryScheduled = true;
+                            return;
+                        }
+                        dbgWarn('[流程] 写库前模板缓存/布局未就绪且重试次数用尽，放弃本次写入（等待自动建表）。');
+                        if (statWriteOverlayGen === gen) pendingStatWrite = null;
+                        return;
+                    }
+                    // 切卡隔离：插件运行时（currentJsonTableData）可能在聊天切换后还挂着上一张卡
+                    // 的表格。若此时按旧卡数据写库，diff 识别不了布局外的组 → 回退快照 → 把跨卡
+                    // 数据写进当前聊天 checkpoint（日志表现：target 混入上一张卡的组、checkpoint 膨胀）。
+                    // 检测到跨卡残留表时直接丢弃本次写入（不重试，等插件完成切换后由后续写入接手）。
+                    try {
+                        const foreign = runtimeForeignTableNames(api, activeLayout);
+                        if (foreign.length) {
+                            dbgWarn('[流程] 写库前检测到跨卡残留表：' + foreign.join('、') + '，丢弃本次写入（等待插件完成聊天切换）。');
+                            if (statWriteOverlayGen === gen) pendingStatWrite = null;
+                            return;
+                        }
+                    } catch (e) {}
+                    // 对齐参考卡：不做手工锚定/物化，等待插件把运行时表格就绪
+                    // （initGameSession/回放后的异步物化）。就绪后直接用运行时作基线 diff。
+                    const rtReady = await waitRuntimeTablesReady(api, activeLayout, 5000);
+                    assertRuntimeSession(writeSession);
+                    if (!rtReady) {
+                        // 插件运行时尚未就绪（刷新后回放/开局建表异步）：延后重试，不手工物化
+                        if (overlayFlushRetries < 6) {
+                            overlayFlushRetries += 1;
+                            dbg('[流程] 插件运行时未就绪，延后重试写库（#' + overlayFlushRetries + '）。');
+                            hostWindow.setTimeout(() => {
+                                if (statWriteOverlayGen === gen) scheduleWindowStatOverlay(target, null, true, isInitializationWrite, writeChatKey, writeSession);
+                            }, 800);
+                            retryScheduled = true;
+                            return;
+                        }
+                        dbgWarn('[流程] 插件运行时迟迟未就绪，放弃本次写入。');
+                        if (statWriteOverlayGen === gen) pendingStatWrite = null;
+                        return;
+                    }
+                    // New complete-object layouts require the host's published
+                    // SQLite runtime. A missing getter may mean loading or native;
+                    // retry without staging data, then fail rather than guessing.
+                    if (readCardApiMetadata().statStorage?.version >= 2
+                        && typeof api.querySql !== 'function' && typeof api.executeSqlQuery !== 'function') {
+                        if (overlayFlushRetries < 6) {
+                            overlayFlushRetries += 1;
+                            hostWindow.setTimeout(() => {
+                                if (statWriteOverlayGen === gen) scheduleWindowStatOverlay(target, null, true, isInitializationWrite, writeChatKey, writeSession);
+                            }, 800);
+                            retryScheduled = true;
+                            return;
+                        }
+                        toast('SQLite 运行时未就绪，已停止本次变量写入。请检查数据库模式与加载状态。', 'error');
+                        if (statWriteOverlayGen === gen) pendingStatWrite = null;
+                        return;
+                    }
+                    // SQL 读取能力不代表旧布局 CRUD 就绪：SP 9.2.5 在 native 模式下始终
+                    // 隐藏 querySql/executeSqlQuery。SQLite CRUD 自身会等待 provider
+                    // 发布，并在 commit 内核验 readiness/revision；此处只检查实际表格，
+                    // 保留来源会话守卫和写入失败重试，不以 SQL getter 拦截原生写入。
+                    // 诊断：写库前运行时与持久化重建的行数对比，定位“回放窗口/填表窗口”竞争
+                    try {
+                        if (mvu2ledgerDebugOn()) {
+                            const cur2 = api.exportTableAsJson() || {};
+                            const rtRows = [];
+                            const pRows = [];
+                            let pData = null;
+                            try { pData = readPersistedTableData(); } catch (e) {}
+                            for (const L of (Array.isArray(activeLayout) ? activeLayout : [])) {
+                                let rc = 0;
+                                for (const k in cur2) {
+                                    if (k.indexOf('sheet_') === 0 && cur2[k] && cur2[k].name === L.table && Array.isArray(cur2[k].content)) { rc = cur2[k].content.length - 1; break; }
+                                }
+                                rtRows.push(L.table + ':' + rc);
+                                if (pData) {
+                                    const ps = Object.values(pData).find(s => s && s.name === L.table);
+                                    pRows.push(L.table + ':' + (ps && Array.isArray(ps.content) ? ps.content.length - 1 : 0));
+                                }
+                            }
+                            dbg('[写库时序] gen=' + gen + ' 重试=' + overlayFlushRetries +
+                                ' | 运行时行数: ' + rtRows.join(',') +
+                                (pRows.length ? ' | 持久化行数: ' + pRows.join(',') : ' | 持久化重建: 无'));
+                        }
+                    } catch (eDiag) {}
+                    // 写基线用运行时（插件已就绪，运行时即最新已提交状态）而不是持久化重建，
+                    // 避免与持久化帧的提交时序产生差异；持久化优先只服务前端读侧。
+                    let prev = {};
+                    try {
+                        const rtAll = window.MVU2LEDGER_CORE.statDataFromTables(activeLayout, api.exportTableAsJson());
+                        if (rtAll && rtAll.stat_data && typeof rtAll.stat_data === 'object') prev = rtAll.stat_data;
+                    } catch (eP) {}
+                    // 调用方归属校验：target 顶层组混入当前布局外的组（如切到催眠APP后，
+                    // 上一张道渊的前端 iframe 仍在运行、定时 replaceMvuData）→ 调用方是
+                    // 跨卡残留的旧前端，整笔丢弃，不再剥离后继续写。否则每 150ms 一次
+                    // 无意义写库+保存刷屏，还会在原生填表窗口制造“第二写者”竞争。
+                    const rawGroups2 = Object.keys(target || {}).filter(g => g !== '$internal');
+                    const layoutGroupSet2 = new Set((Array.isArray(activeLayout) ? activeLayout : []).map(L => L.group));
+                    let hasForeignGroup2 = false;
+                    for (const g of rawGroups2) {
+                        if (!layoutGroupSet2.has(g)) { hasForeignGroup2 = true; break; }
+                    }
+                    if (!(readCardApiMetadata().statStorage?.version >= 1) && hasForeignGroup2 && rawGroups2.length) {
+                        if (lastForeignWriteDropChat !== chatKeyNow) {
+                            lastForeignWriteDropChat = chatKeyNow;
+                            dbgWarn('[切卡隔离] 检测到跨卡残留前端写库（target 混入布局外组：' + rawGroups2.join('、') + '），整笔丢弃，后续同类写入静默跳过。');
+                        }
+                        if (statWriteOverlayGen === gen) pendingStatWrite = null;
+                        return;
+                    }
+                    // 前端/脚本传来的 target 可能不完整：开场读取时布局未就绪，只拿到部分组
+                    // （如只有 系统.本轮APP操作，缺 主角 等）。把 target 叠到当前表状态（prev）上，
+                    // 普通旧布局缺失的顶层组用现有数据补齐——否则快照/合并模板会把已有组清空，
+                    // 最终 importTableAsJson 还可能存旧 checkpoint，导致“写入未保存”。
+                    const storageEnabled = readCardApiMetadata().statStorage?.version >= 1;
+                    const fullPrev = nativeStatStorage.merge({ stat_data: prev }).stat_data;
+                    let effectiveTarget = (() => {
+                        if (!target || typeof target !== 'object') return prev || {};
+                        if (storageEnabled) return JSON.parse(JSON.stringify(target));
+                        const out = JSON.parse(JSON.stringify(prev || {}));
+                        // 切卡隔离：前端可能缓存上一张卡的 stat_data（target 混入当前布局外的组）。
+                        // 只接受当前布局内的顶层组，布局外的组一律丢弃，避免串卡数据写进当前聊天。
+                        const allowedGroups = new Set((Array.isArray(activeLayout) ? activeLayout : []).map(L => L.group));
+                        // 新完整容器布局明确编码“顶层键缺失”。完整 replace 快照省略它即删除，
+                        // 不能套用旧的补组保护；读完整基线后再改一个字段的操作会保留其他组。
+                        for (const L of Array.isArray(activeLayout) ? activeLayout : []) {
+                            if (L.kind !== 'singleton' || !L.valueCol || Object.prototype.hasOwnProperty.call(target, L.group)) continue;
+                            const whole = (L.cols || []).some(c => c[0] === L.valueCol && c[1] === 'jsonObjectOptional'
+                                && Array.isArray(c[3]) && c[3].length === 1 && c[3][0] === L.group);
+                            if (whole) delete out[L.group];
+                        }
+                        for (const k of Object.keys(target)) {
+                            if (k === '$internal') continue;
+                            if (storageEnabled || allowedGroups.has(k)) {
+                                const tv = target[k];
+                                const pv = out[k];
+                                // 空组保护（行表 rows 与关系子表集合 nestedRows）：前端 target
+                                // 该组为空对象而当前（prev）有数据时保留 prev——MVU 前端常分批/按需
+                                // 发 stat_data，行表/关系子表空组可能是“数据未加载”而非“删除所有行”
+                                // （DELETE-only 会丢行）。JSON 表显式置空 = 清空内容（前端取消任务等
+                                // 真实操作，如 任务={}），单例表空对象无键自然无操作——两者都不需要保护。
+                                const isEmptyObj = tv && typeof tv === 'object' && !Array.isArray(tv) && Object.keys(tv).length === 0;
+                                const prevNonEmpty = pv && typeof pv === 'object' && !Array.isArray(pv) && Object.keys(pv).length > 0;
+                                const grpLayout = (Array.isArray(activeLayout) ? activeLayout : []).find(L => L.group === k);
+                                if (isEmptyObj && prevNonEmpty && grpLayout && (grpLayout.kind === 'rows' || grpLayout.kind === 'nestedRows')) {
+                                    dbg(' [空组保护] target.' + k + ' 为空对象而 prev 有数据，保留 prev（不视为删除）。');
+                                    continue;
+                                }
+                                out[k] = tv;
+                            }
+                            else if (target[k] !== undefined && target[k] !== null && typeof target[k] === 'object') {
+                                dbg(' [切卡隔离] target 剥离布局外组：' + k);
+                            }
+                        }
+                        return out;
+                    })();
+                    if (storageEnabled) {
+                        // Native values follow complete replacement semantics.
+                        effectiveTarget = nativeStatStorage.combine(nativeStatStorage.split(effectiveTarget).database,
+                            nativeStatStorage.split(target).native);
+                    }
+                    if (!storageEnabled || !writeSession.rawAuthorWrite) effectiveTarget = await validateCardStat(effectiveTarget, writeSession.schemaProof);
+                    assertRuntimeSession(writeSession);
+                    const fullEffectiveTarget = effectiveTarget;
+                    if (storageEnabled) effectiveTarget = nativeStatStorage.split(fullEffectiveTarget).database;
+                    const unmappedAfterSchema = window.MVU2LEDGER_CORE.unmappedStatGroups(activeLayout, prev, effectiveTarget);
+                    if (unmappedAfterSchema.length) throw new Error('Schema 产生未映射组：' + unmappedAfterSchema.join('、'));
+                    // 诊断：打印实际到达写路径的 系统._hypnoos（成就/购买等内部状态），
+                    // 判断前端是否把标记放进写回、以及我们是否丢值。
+                    try {
+                        if (mvu2ledgerDebugOn() && target && target.系统 && typeof target.系统 === 'object') {
+                            const h0 = target.系统._hypnoos;
+                            if (h0 !== undefined) {
+                                dbg('[写库诊断] target 系统._hypnoos = ' + JSON.stringify(h0).slice(0, 500));
+                            }
+                        }
+                    } catch (eH) {}
+                    // 写回守卫：单例组“整组写回”若把多个字段同时重置成模板初始值，而当前运行时是
+                    // 非默认值，判定为前端“空读/旧读 → schema 默认值 → 写回”，恢复运行时值（保留数据库真值）。
+                    // 通用实现：用卡自己的模板初始行做基准，任何转换卡都适用；只拦“回退到模板默认”的写回。
+                    try {
+                        const tplGuard = cachedTemplateForCurrentCard();
+                        if (tplGuard && effectiveTarget && typeof effectiveTarget === 'object') {
+                            for (const L of (Array.isArray(activeLayout) ? activeLayout : [])) {
+                                if (L.kind !== 'singleton') continue;
+                                const tplSheet = Object.values(tplGuard).find(function (s) { return s && s.name === L.table; });
+                                if (!tplSheet || !Array.isArray(tplSheet.content) || tplSheet.content.length < 2) continue;
+                                const tplHdr = tplSheet.content[0];
+                                const tplRow = tplSheet.content[1];
+                                const tgt = effectiveTarget[L.group];
+                                const base = prev[L.group];
+                                if (!tgt || typeof tgt !== 'object' || Array.isArray(tgt)) continue;
+                                if (!base || typeof base !== 'object' || Array.isArray(base)) continue;
+                                const str = function (v) { return String(v == null ? '' : v); };
+                                let resetCount = 0;
+                                let changedCount = 0;
+                                const cols = [];
+                                for (let ci = 1; ci < tplHdr.length; ci++) {
+                                    const col = tplHdr[ci];
+                                    if (col === '_扩展数据') continue;
+                                    if (!(col in tgt) || !(col in base)) continue;
+                                    const tv = str(tplRow[ci]);
+                                    const gv = str(tgt[col]);
+                                    const bv = str(base[col]);
+                                    if (gv === tv && bv !== tv) { resetCount += 1; changedCount += 1; cols.push(col); }
+                                    else if (gv !== bv) changedCount += 1;
+                                }
+                                // 只拦“整组的全部变化都是回到模板默认值”的空读写回：真实游戏
+                                // 操作（重开一局、重置技能、商店刷新）通常伴随非默认值变化，
+                                // 不应被守卫吞掉。
+                                if (resetCount >= 2 && changedCount === resetCount) {
+                                    for (const col of cols) tgt[col] = base[col];
+                                    dbg(' [写回守卫] 单例组「' + L.group + '」检测到默认值写回（' + cols.join('、') + '），保留数据库真值。');
+                                }
+                            }
+                        }
+                    } catch (eG) {}
+                    // 已能证明本楼 CRUD 归属时保留差量；新楼先以最终候选快照正式提交。
+                    // checkpoint/落盘始终由 SP 维护，不创建空锚点或手写历史帧。
+                    let n = 0;
+                    let diffWriteResult = null;
+                    let bulkInit = false;
+                    let replySnapshot = !!writeSession.messageUpdate;
+                    try {
+                        // 诊断（保留）：布局组、target/prev 含组、首个非空写入、checkpoint 是否含注入
+                        try {
+                            const diagGroups = (Array.isArray(activeLayout) ? activeLayout : []).map(L => L.group);
+                            const targetGroups = Object.keys(effectiveTarget || {}).filter(g => effectiveTarget[g] && typeof effectiveTarget[g] === 'object');
+                            const prevGroups = Object.keys(prev || {}).filter(g => prev[g] && typeof prev[g] === 'object');
+                            const firstWriteField = (() => {
+                                for (const g of targetGroups) {
+                                    const v = effectiveTarget[g];
+                                    if (!v || typeof v !== 'object') continue;
+                                    for (const k of Object.keys(v)) {
+                                        const vv = v[k];
+                                        if (vv !== undefined && vv !== null && vv !== '') return g + '.' + k + '=' + String(vv).slice(0, 40);
+                                    }
+                                }
+                                return '';
+                            })();
+                            dbg('[注入合并] 本扩展会话首次兼容写库=' + !openingWriteSettledChats.has(chatKeyNow) +
+                                ' | 布局组=' + diagGroups.join('、') +
+                                ' | target含组=' + targetGroups.join('、') +
+                                ' | prev含组=' + prevGroups.join('、') +
+                                ' | 首个非空写入=' + (firstWriteField || '无') +
+                                ' | 空组保护=启用');
+                            // 诊断：每张行/JSON 表的 prev/target 键集合与 writePaths，定位“DELETE-only 误删”
+                            try {
+                                const isObj2 = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+                                const groupDiags = [];
+                                for (const L of (Array.isArray(activeLayout) ? activeLayout : [])) {
+                                    const wp = (L.writePaths || [])[0] || [L.group];
+                                    const dictAt = (obj) => {
+                                        let c = obj;
+                                        for (const p of wp) { if (c === null || c === undefined || typeof c !== 'object') return undefined; c = c[p]; }
+                                        return c;
+                                    };
+                                    const pv = dictAt(prev);
+                                    const tv = dictAt(effectiveTarget);
+                                    const pKeys = isObj2(pv) ? Object.keys(pv) : [];
+                                    const tKeys = isObj2(tv) ? Object.keys(tv) : [];
+                                    if (L.kind === 'rows' || L.kind === 'json') {
+                                        groupDiags.push(L.group + '{' + L.kind + ',wp=' + wp.join('.') + ',prev=[' + pKeys.slice(0, 8).join(',') + '](' + pKeys.length + '),target=[' + tKeys.slice(0, 8).join(',') + '](' + tKeys.length + ')}');
+                                    } else if (L.kind === 'singleton') {
+                                        groupDiags.push(L.group + '{singleton,wp=' + wp.join('.') + ',prev=' + (isObj2(pv) ? JSON.stringify(pv).slice(0, 80) : 'none') + ',target=' + (isObj2(tv) ? JSON.stringify(tv).slice(0, 80) : 'none') + '}');
+                                    }
+                                }
+                                dbg('[注入合并] 分组诊断: ' + (groupDiags.length ? groupDiags.join(' | ') : '无'));
+                            } catch (eGrp) {}
+                        } catch (e) {}
+                        // 把持久化重建结果传给核心写路径：运行时仅表头但 checkpoint/日志已有该表
+                        // 数据行时，核心补行必须跳过（否则造重复行 → “手动追平完整性校验失败”）。
+                        let persistedForWrite = null;
+                        try { persistedForWrite = readPersistedTableData(); } catch (e) {}
+                        let tableBroadcastSuppressed = false;
+                        try {
+                            // 一次 replaceMvuData 可能翻译成多个 CRUD。插件每个
+                            // CRUD 都会触发表更新回调；若逐格转发 MVU 事件，
+                            // 前端会在中间态重读/重渲染数十次。整批期间抑制，
+                            // 待全部落库后由下方统一广播一次。
+                            sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded = (Number(sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded) || 0) + 1;
+                            tableBroadcastSuppressed = true;
+                            nativeWrite = nativeStatStorage.stage(fullEffectiveTarget, writeSession);
+                            const needsReplySnapshot = replySnapshot || !!(writeSession.writeTarget && !writeSession.writeTarget.canUseCrud());
+                            const currentReplyBatch = !needsReplySnapshot && writeSession.writeTarget &&
+                                (writeSession.writeTarget.index > 0 || !isInitializationWrite);
+                            replySnapshot = needsReplySnapshot || !!currentReplyBatch;
+                            bulkInit = needsReplySnapshot
+                                ? await commitMessageUpdateSnapshot(api, prev, effectiveTarget, writeSession)
+                                : currentReplyBatch
+                                    ? await commitCurrentReplyBatch(api, prev, effectiveTarget, persistedForWrite, writeSession)
+                                    : await tryOpeningBulkInit(api, prev, effectiveTarget, chatKeyNow, isInitializationWrite, writeSession);
+                        } catch (e) {
+                            if (e?.code === 'MVU_STAT_REPRESENTATION_UNSUPPORTED') {
+                                bulkInit = 'rejected';
+                                console.warn('[mvu2ledger] ' + e.message);
+                            } else if (replySnapshot) bulkInit = 'retry';
+                            dbgWarn(' 回复写入或开局提交异常：' + (e && e.message ? e.message : e));
+                        }
+                        try {
+                            assertRuntimeSession(writeSession);
+                            if (bulkInit === 'rejected') {
+                                writeUnsettled = true;
+                                n = 0;
+                            } else if (bulkInit === 'retry') {
+                                writeUnsettled = true;
+                                if (overlayFlushRetries < 6) {
+                                    overlayFlushRetries += 1;
+                                    dbg(' 回复写入或开局提交尚未落定，延后重试（#' + overlayFlushRetries + '）。');
+                                    hostWindow.setTimeout(() => {
+                                        if (statWriteOverlayGen === gen) scheduleWindowStatOverlay(target, null, true, isInitializationWrite, writeChatKey, writeSession);
+                                    }, 1000);
+                                    retryScheduled = true;
+                                }
+                                n = 0;
+                            } else if (bulkInit) {
+                                n = 1;
+                                dbg(replySnapshot ? ' 更新批次已提交到目标回复。' : ' 开局整表初始化快速路径完成（一次整表原子提交，跳过逐格 CRUD）。');
+                            } else if (replySnapshot) {
+                                // 当前回复无差异时不创建表帧，也不退回未经批次规划的 CRUD。
+                                n = 0;
+                            } else {
+                                // 差异明细诊断：包一层 API 代理记录每个 CRUD 的表/行/列与前后值。
+                                // 用于排查“duplicate_snapshot 已判定快照相同、diff 却产生多条操作”的
+                                // 读回形状偏差（历史案例：圣樱学院-RE 开场最终快照 19 条逐格补写）。
+                                let diffApi = api;
+                                if (mvu2ledgerDebugOn() && api && typeof api.updateCell === 'function') {
+                                    const clip = (v) => { try { const s = typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v); return s.length > 60 ? s.slice(0, 60) + '…' : s; } catch (e) { return String(v); } };
+                                    const cellNow = (t, ri, col) => {
+                                        try {
+                                            const all = api.exportTableAsJson() || {};
+                                            const s = Object.values(all).find(x => x && x.name === t);
+                                            const row = s && Array.isArray(s.content) ? s.content[ri] : null;
+                                            const hdr = s && s.content ? s.content[0] : [];
+                                            const ci = hdr.indexOf(col);
+                                            return row && ci >= 0 ? clip(row[ci]) : '(定位失败)';
+                                        } catch (e) { return '(读取失败)'; }
+                                    };
+                                    diffApi = Object.assign({}, api, {
+                                        updateCell: async (t, ri, col, v) => {
+                                            dbg('[差异明细] updateCell ' + t + '[' + ri + '].' + col + ' : ' + cellNow(t, ri, col) + ' → ' + clip(v));
+                                            return api.updateCell(t, ri, col, v);
+                                        },
+                                        updateRow: async (t, ri, p) => {
+                                            dbg('[差异明细] updateRow ' + t + '[' + ri + '] {' + Object.keys(p || {}).join('、') + '}');
+                                            return api.updateRow(t, ri, p);
+                                        },
+                                        insertRow: async (t, o) => {
+                                            dbg('[差异明细] insertRow ' + t + ' {' + Object.keys(o || {}).join('、') + '}');
+                                            return api.insertRow(t, o);
+                                        },
+                                        deleteRow: async (t, ri) => {
+                                            dbg('[差异明细] deleteRow ' + t + '[' + ri + ']');
+                                            return api.deleteRow(t, ri);
+                                        },
+                                    });
+                                }
+                                diffWriteResult = await window.MVU2LEDGER_CORE.writeStatDiffToDbResult(diffApi, activeLayout, prev, effectiveTarget, persistedForWrite);
+                                n = diffWriteResult.plannedChanges;
+                                assertRuntimeSession(writeSession);
+                            }
+                        } finally {
+                            if (tableBroadcastSuppressed) {
+                                sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded = Math.max(0, (Number(sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded) || 1) - 1);
+                            }
+                        }
+                        if (n > 0) {
+                            openingWriteSettledChats.add(chatKeyNow);
+                            pruneOrderedCollection(openingWriteSettledChats, 80);
+                            lastDbWriteAt = Date.now();
+                            dbg(diffWriteResult && !diffWriteResult.ok ? ' Mvu 差异写入未完成：计划 ' + n + ' 条；' + diffWriteResult.failureReason
+                                : replySnapshot ? ' Mvu 写入完成：当前回复批次已提交，由数据库持久化。'
+                                : bulkInit === true ? ' Mvu 写入完成：一次整表提交，插件自行持久化。' : ' Mvu 写入完成：差异 ' + n + ' 条（原生 CRUD，插件自行持久化）');
+                        } else {
+                            dbg(diffWriteResult && !diffWriteResult.ok ? ' Mvu 差异写入未完成：' + diffWriteResult.failureReason
+                                : ' 差异写入无操作（运行时与目标一致），跳过。');
+                        }
+                        // 写入出现失败（首楼替换/插件回放会清空运行时，导致 updateCell 越界等）：
+                        // 不能当场补行——原行稍后会被重放恢复，补出来的行会变成重复行。
+                        // 改为延迟重跑整次合并：waitRuntimeTablesReady 会等到插件重放完成，
+                        // 原行回来就直接写、不重复；行真没了才由 seedNeeded 补。
+                        try {
+                            if (diffWriteResult && !diffWriteResult.ok) {
+                                writeUnsettled = true;
+                                if (overlayFlushRetries < 4) {
+                                overlayFlushRetries += 1;
+                                dbg(' 写入存在失败（运行时被清空/行缺失），稍后重试合并（#' + overlayFlushRetries + '）。');
+                                hostWindow.setTimeout(() => {
+                                    if (statWriteOverlayGen === gen) scheduleWindowStatOverlay(target, null, true, isInitializationWrite, writeChatKey, writeSession);
+                                }, 1500);
+                                retryScheduled = true;
+                                }
+                            }
+                        } catch (eR) {}
+                    } catch (e) {
+                        writeUnsettled = true;
+                        dbgWarn(' 差异写入异常:', e && e.message ? e.message : e);
+                    }
+                    assertRuntimeSession(writeSession);
+                    // 确保本次写入的持久化帧已落盘：插件保存可能防抖/异步，切聊天前不落盘会丢最后写入，
+                    // 回放旧状态 → 前端读旧 → 写回默认值（“切换后还原”的直接来源）。只等待，不手工构造保存内容。
+                    try {
+                        const ctx2 = getContextSafe();
+                        const saveFn2 = (typeof ctx2.saveChatConditional === 'function' && ctx2.saveChatConditional.bind(ctx2)) ||
+                            (typeof ctx2.saveChat === 'function' && ctx2.saveChat.bind(ctx2)) ||
+                            (typeof window.saveChatConditional === 'function' ? window.saveChatConditional.bind(window) : null) ||
+                            (typeof window.saveChat === 'function' ? window.saveChat.bind(window) : null);
+                        // 整表快速路径内的 importTableAsJson/initGameSession 已由插件以
+                        // strictSave 提交；此处再保存一次会与卡内重载争用宿主保存锁。
+                        // 仅逐格 CRUD 路径需要这层等待。
+                        if (nativeWrite?.changed && bulkInit !== true && !saveFn2) throw new Error('酒馆消息保存接口不可用');
+                        if (saveFn2 && (nativeWrite?.changed || n > 0) && bulkInit !== true) {
+                            await Promise.resolve(saveFn2());
+                            assertRuntimeSession(writeSession);
+                            dbg('[保存] 写库后已等待酒馆保存完成。');
+                        }
+                    } catch (eS) { nativeWrite?.rollback(); writeUnsettled = true; }
+                    assertRuntimeSession(writeSession);
+                    // 只有真正写了差异（n>0）才广播 VARIABLE_UPDATE_ENDED：
+                    // 无差异回声写（前端把整份 stat_data 原样写回）此前也会触发广播 →
+                    // 前端收到后重渲染 → 再回声 → 再广播，形成“一直刷”循环。
+                    // 与官方语义一致：状态没变就不发更新事件。
+                    const afterMvu = !writeUnsettled ? nativeStatStorage.merge(mvuDataFromCompleteTableSnapshot(api.exportTableAsJson()) || { stat_data: effectiveTarget, display_data: JSON.parse(JSON.stringify(effectiveTarget)), delta_data: {}, initialized_lorebooks: {} }) : null;
+                    // Include bulk imports and successful no-op commits: their state
+                    // can differ from the recovery cache even when n is zero. Refresh
+                    // before events can replace the checkpoint's message carrier.
+                    if (afterMvu) refreshOpeningContinuityAfterWrite(chatKeyNow, afterMvu.stat_data);
+                    if ((n > 0 || nativeWrite?.stateChanged) && !writeUnsettled) {
+                        // 与官方 updateVariables 一致：VARIABLE_UPDATE_ENDED 期间 stat_data.$internal
+                        // 临时携带 display_data/delta_data（事件后移除），供前端在事件回调里读取
+                        // 自有写入期间抑制了 SP 回调，先发布实际已提交状态。
+                        stageFrontendCommittedMvuRead(afterMvu);
+                        let hadInternal = false;
+                        try { if (effectiveTarget && typeof effectiveTarget === 'object' && effectiveTarget.$internal === undefined) { effectiveTarget.$internal = { display_data: afterMvu.display_data, delta_data: afterMvu.delta_data }; hadInternal = true; } } catch (e) {}
+                        if (bulkInit && !replySnapshot && !writeSession.rawAuthorWrite) emitMvuEvent('mag_variable_initialized', afterMvu, 0);
+                        dispatchVariableUpdateEnded(afterMvu, { stat_data: fullPrev, display_data: fullPrev, delta_data: {}, initialized_lorebooks: {} }, !!(writeSession.businessEventEmitted || writeSession.rawAuthorWrite));
+                        try { if (hadInternal) delete effectiveTarget.$internal; } catch (e) {}
+                    }
+                    // 写入已落定（含“差异无操作”）：调用方（如开场分支注入）可在此时提交指纹
+                    settledOk = !writeUnsettled;
+                } else {
+                    dbgWarn(' Mvu 合并写库被跳过：api=' + !!api + ' activeLayout=' + (activeLayout ? '有' : '空'));
+                }
+            } catch (e) {
+                dbgWarn(' Mvu 合并写入异常:', e);
+            } finally {
+                if (!settledOk) nativeWrite?.rollback();
+                if (statWriteOverlayGen === gen) {
+                    pendingStatWrite = null;
+                    if (!retryScheduled) pendingStatWriteIsInitialization = false;
+                    invalidateStatProjectionCache();
+                    try {
+                        const ph = (typeof window !== 'undefined' ? window : root);
+                        if (ph && ph.__mvu2ledgerPendingStat === target) ph.__mvu2ledgerPendingStat = null;
+                    } catch (e) {}
+                    // 已安排重试时保持 Promise pending，由最终重试结算。
+                    if (!retryScheduled && statWriteFlushResolve) {
+                        const resolveFlush = statWriteFlushResolve;
+                        statWriteFlushResolve = null;
+                        statWriteFlushPromise = null;
+                        resolveFlush(settledOk);
+                    }
+                }
+            }
+        };
+        statWriteTimer = hostWindow.setTimeout(() => {
+            const task = statWriteInFlight.then(runFlush);
+            statWriteInFlight = task.catch(e => { dbgWarn(' Mvu 写队列异常:', e); });
+            return task;
+        }, 150);
+        return flushPromise;
+    }
+
+    // 扩展侧提供 window.getAllVariables：用卡内布局 + 插件表格实时重建 stat_data（惰性，零冗余）。
+    // 只在当前卡是本转换器产物时安装；切到其他卡时恢复原函数（或删除），不污染其他卡。
+    let installedGetAllVariables = false;
+    let originalGetAllVariables = undefined;
+    // 只读：运行时为空/插件异步回放中/切卡残留时，从当前聊天持久化帧（V2 storageFrame）重建表格数据。
+    // 仅用于读侧兜底，防止前端“空读 → schema 默认值 → 写回”把数据库重置成默认值；不写运行时。
+    // 基底取最后一个 full checkpoint 或 data_replace 完整后态；随后按 logEntries 顺序应用
+    // row_upsert / row_delete；遇到 SQL 等其他操作交由宿主完成回放，不返回部分重建结果。
+    let persistedReadCache = { key: '', data: null };
+    function persistedFrameFingerprint(value) {
+        let source = '';
+        try { source = typeof value === 'string' ? value : JSON.stringify(value); } catch (e) { source = String(value || ''); }
+        // FNV-1a：避免“新旧 storageFrame JSON 恰好等长”时误用旧缓存。
+        let hash = 2166136261;
+        for (let i = 0; i < source.length; i++) {
+            hash ^= source.charCodeAt(i);
+            hash = Math.imul(hash, 16777619);
+        }
+        return source.length + ':' + (hash >>> 0).toString(16);
+    }
+    // SP 表更新回调的参数是事务已提交的新快照，但紧接着的
+    // exportTableAsJson() 可能仍处在 replay/物化窗口而返回旧值。
+    // 状态栏在更新回调后立即重读时，必须看到与回调事件同一份 after；
+    // 只保留很短的读窗口，超时后仍回归插件运行时/持久化重建。
+    let frontendCommittedMvuRead = null;
+    function stageFrontendCommittedMvuRead(after) {
+        try {
+            frontendCommittedMvuRead = {
+                chatKey: autoInitChatId(),
+                cardKey: cardCacheKey(currentCharacter()),
+                expiresAt: Date.now() + 5000,
+                value: JSON.parse(JSON.stringify(after)),
+            };
+        } catch (e) { frontendCommittedMvuRead = null; }
+    }
+    function readFrontendCommittedMvuRead() {
+        try {
+            const item = frontendCommittedMvuRead;
+            if (!item) return null;
+            if (item.chatKey !== autoInitChatId() || item.cardKey !== cardCacheKey(currentCharacter()) || Date.now() > item.expiresAt) {
+                frontendCommittedMvuRead = null;
+                return null;
+            }
+            return nativeStatStorage.merge(JSON.parse(JSON.stringify(item.value)));
+        } catch (e) { return null; }
+    }
+    // 只读：从当前聊天持久化帧（V2 storageFrame）重建表格数据——“数据库真相”。
+    // 基底取最后一个 full checkpoint 或 data_replace 完整后态；只应用其后 logEntries 的
+    // row_upsert / row_delete；其余操作只信任宿主已完成的回放。
+    // 用于读侧兜底：运行时只是缓存（异步回放中可能为空/旧值），可完整重建的持久化帧才可作为备用读取，
+    // 防止前端“空读/旧读 → schema 默认值 → 写回”把数据库重置成默认值。不写运行时。
+    // 带按聊天缓存（key = 各消息 storage 帧长度和），写库/切聊天后自动失效。
+    function readPersistedTableData(endIndex) {
+        const ledgerApi = getAcuApi();
+        if (ledgerApi?.__mvu_ledger__) { try { return ledgerApi.readPersistedTableData(endIndex); } catch (_) { return null; } }
+        try {
+            const ctx = getContextSafe();
+            const chat = Array.isArray(ctx.chat) ? ctx.chat : [];
+            const count = endIndex == null ? chat.length : Math.max(0, Math.min(chat.length, endIndex + 1));
+            let key = count + ':';
+            for (let mi = 0; mi < count; mi++) {
+                const msg = chat[mi];
+                if (!msg || typeof msg !== 'object') continue;
+                const iso = msg.TavernDB_ACU_IsolatedData;
+                key += persistedFrameFingerprint(iso) + ',';
+            }
+            if (persistedReadCache.key === key) return persistedReadCache.data;
+            let base = null;
+            const ops = [];
+            for (let mi = 0; mi < count; mi++) {
+                const msg = chat[mi];
+                if (!msg || typeof msg !== 'object') continue;
+                let iso = msg.TavernDB_ACU_IsolatedData;
+                if (typeof iso === 'string') { try { iso = JSON.parse(iso); } catch (e) { continue; } }
+                if (!iso || typeof iso !== 'object' || Array.isArray(iso)) continue;
+                for (const tagKey of Object.keys(iso)) {
+                    const tag = iso[tagKey];
+                    if (!tag || typeof tag !== 'object' || Array.isArray(tag)) continue;
+                    const sf = tag.storageFrame;
+                    if (!sf || typeof sf !== 'object' || sf.version !== 2 || !Array.isArray(sf.logEntries)) continue;
+                    const cp = sf.checkpoint;
+                    if (cp && cp.kind === 'full' && cp.data && typeof cp.data === 'object') {
+                        base = JSON.parse(JSON.stringify(cp.data));
+                        ops.length = 0; // 该 checkpoint 已包含此前所有操作
+                    }
+                    for (const en of sf.logEntries) {
+                        const eops = Array.isArray(en && en.operations) ? en.operations : [];
+                        for (const op of eops) {
+                            if (!op || typeof op !== 'object') continue;
+                            if (op.kind === 'data_replace' && op.data && typeof op.data === 'object') {
+                                base = JSON.parse(JSON.stringify(op.data));
+                                ops.length = 0;
+                            } else {
+                                // Keep unsupported operations in sequence: ignoring one
+                                // would turn an older checkpoint into a false latest state.
+                                ops.push(op);
+                            }
+                        }
+                    }
+                }
+            }
+            let result = null;
+            if (base) {
+                for (const op of ops) {
+                    const sheet = base[op.sheetKey];
+                    if (!sheet || !Array.isArray(sheet.content)) {
+                        persistedReadCache = { key, data: null };
+                        return null;
+                    }
+                    if (op.kind === 'row_delete') {
+                        const rid = String(op.rowId == null ? '' : op.rowId);
+                        sheet.content = sheet.content.filter(function (row, idx) {
+                            return idx === 0 || !Array.isArray(row) || String(row[0] == null ? '' : row[0]).trim() !== rid;
+                        });
+                    } else if (op.kind === 'row_upsert' && Array.isArray(op.cells)) {
+                        const rid = String(op.rowId == null ? '' : op.rowId);
+                        const cells = JSON.parse(JSON.stringify(op.cells));
+                        const idx = sheet.content.findIndex(function (row, i2) {
+                            return i2 > 0 && Array.isArray(row) && String(row[0] == null ? '' : row[0]).trim() === rid;
+                        });
+                        if (idx >= 0) sheet.content[idx] = cells;
+                        else sheet.content.push(cells);
+                    } else {
+                        // SQL and other host operations require the host's real
+                        // replay engine. A synchronous fallback cannot execute
+                        // their semantics; wait for its published runtime instead.
+                        persistedReadCache = { key, data: null };
+                        return null;
+                    }
+                }
+                result = base;
+            }
+            persistedReadCache = { key, data: result };
+            return result;
+        } catch (e) { return null; }
+    }
+
+    // EJS 会在 CHAT_CHANGED 的同步提示词构建阶段执行，比 autoInitDatabase
+    // 的延时完整卡加载更早。这里直接从当前角色扩展标记同步恢复布局，
+    // 否则 getAllVariables 的早期读取会因 activeLayout 未就绪返回空 stat_data。
+    function ensureActiveLayoutLazy() {
+        try {
+            if (activeLayout && layoutBelongsToCurrentCard(activeLayoutCardKey)) return true;
+            const ch = currentCharacter();
+            if (!ch || !isConvertedMvuCard(ch)) return false;
+            const ext = charExtensions(ch);
+            const mk = ext && ext.mvu2ledger;
+            if (!mk || !mk.layout) return false;
+            const parsed = typeof mk.layout === 'string' ? JSON.parse(mk.layout) : mk.layout;
+            if (!Array.isArray(parsed) || !parsed.length && !(mk.statStorage?.version >= 1)) return false;
+            activeLayout = resolveRuntimeLayout(parsed);
+            activeLayoutCardKey = cardCacheKey(ch);
+            activePlaceholderNeeded = detectPlaceholderFor(ch);
+            // 同步解码卡内模板作为回放未就绪时的结构/初值兜底。
+            try { cachedTemplateForCurrentCard(); } catch (e) {}
+            dbg(' EJS 早期读取：已从当前卡标记惰性恢复布局（' + parsed.length + ' 项）。');
+            return true;
+        } catch (e) { return false; }
+    }
+
+    function ejsVariablesSafe() {
+        let current = null;
+        try { if (typeof window.getAllVariables === 'function') current = window.getAllVariables(); } catch (e) {}
+        try {
+            if (!ensureActiveLayoutLazy()) return current && current.stat_data ? current : { stat_data: {}, display_data: {} };
+            const core = window.MVU2LEDGER_CORE;
+            if (!core || typeof core.statDataFromTables !== 'function') return current || { stat_data: {}, display_data: {} };
+            // 世界书 EJS 与状态栏必须共享同一读优先级：
+            // 待写快照 > SP 已提交回调 > 完整运行时表 > 持久化帧 > 结构骨架。
+            // 旧逻辑无条件优先 checkpoint，当 checkpoint 仍是开局快照而当前表已更新时，
+            // format_message_variable/getvar 会偶发读到默认初始值。
+            if (pendingStatWrite && typeof pendingStatWrite === 'object') {
+                return { stat_data: pendingStatWrite, display_data: {}, delta_data: {}, initialized_lorebooks: {} };
+            }
+            const committed = readFrontendCommittedMvuRead();
+            if (committed && committed.stat_data) return committed;
+            try {
+                const api = getAcuApi();
+                const runtime = api && typeof api.exportTableAsJson === 'function' ? (api.exportTableAsJson() || {}) : null;
+                if (runtime && tableSnapshotCoversLayout(runtime, activeLayout)) {
+                    return statDataFromTablesCached(activeLayout, runtime);
+                }
+            } catch (e) {}
+            // 运行时表尚未完整回放时，checkpoint/log 才是更可靠的当前聊天真相。
+            try {
+                const persisted = readPersistedTableData();
+                if (persisted && tableSnapshotCoversLayout(persisted, activeLayout, true)) {
+                    return statDataFromTablesCached(activeLayout, persisted);
+                }
+            } catch (e) {}
+            // 先用空表+布局构造“必定存在的结构骨架”，再用实际读取覆盖。
+            // 这只防 undefined 链式访问，不触发任何数据库写入。
+            const base = core.statDataFromTables(activeLayout, {});
+            const merge = (dst, src) => {
+                if (!src || typeof src !== 'object' || Array.isArray(src)) return dst;
+                for (const k of Object.keys(src)) {
+                    const sv = src[k];
+                    if (sv && typeof sv === 'object' && !Array.isArray(sv) && dst[k] && typeof dst[k] === 'object' && !Array.isArray(dst[k])) merge(dst[k], sv);
+                    else dst[k] = sv;
+                }
+                return dst;
+            };
+            if (current && current.stat_data && typeof current.stat_data === 'object') merge(base.stat_data, current.stat_data);
+            if (current && current.display_data && typeof current.display_data === 'object') base.display_data = current.display_data;
+            return base;
+        } catch (e) { return current || { stat_data: {}, display_data: {} }; }
+    }
+
+    // 读路径投影缓存：statDataFromTables 是 O(整个 stat_data) 的全量反投影，状态栏
+    // 刷新、EJS 渲染、宏替换每次读都会触发。SP 的 exportTableAsJson() 返回
+    // currentJsonTableData 的稳定引用（数据更新时整体换新对象），据此缓存：
+    // 引用 + 聊天 + 布局一致且未越过短 TTL 时直接复用上次投影（与
+    // stageFrontendCommittedMvuRead 一样把同一对象交给调用方——MVU 原版 getMvuData
+    // 也返回内部对象引用）。写入、SP 提交回调、切聊天都会主动失效；TTL 兜底覆盖
+    // 未被引用替换捕获的原地变更。
+    let statProjectionCache = null;
+    function invalidateStatProjectionCache() { statProjectionCache = null; }
+    function statDataFromTablesCached(layout, tables) {
+        const core = window.MVU2LEDGER_CORE;
+        if (!core || typeof core.statDataFromTables !== 'function') return null;
+        let chatKey = '';
+        try { chatKey = autoInitChatId(); } catch (e) {}
+        const now = Date.now();
+        const hit = statProjectionCache;
+        if (hit && hit.chatKey === chatKey && hit.layout === layout && hit.tables === tables && (now - hit.at) < 1500) return nativeStatStorage.merge(hit.wrap);
+        const wrap = core.statDataFromTables(layout, tables);
+        statProjectionCache = { chatKey, layout, tables, wrap, at: now };
+        return nativeStatStorage.merge(wrap);
+    }
+
+    // 结构骨架只供只读模板兜底，不得作为脚本“读-改-写”的真实快照。
+    // 原生回放期间返回 JSON 容器默认 {}，会被作者的字符串 preprocess
+    // 转成 [object Object] 再写回。标记只存在于本次读取的外层对象，不进变量或存档。
+    function unavailableMvuRead(value) {
+        return Object.defineProperty(Object.assign({}, value), '__mvu2ledgerReadUnavailable', { value: true });
+    }
+    function assertMvuReadReady(value) {
+        if (!value || value.__mvu2ledgerReadUnavailable !== true) return;
+        const error = new Error('数据库变量尚未完成加载，请稍后重试');
+        error.code = 'MVU_DATA_NOT_READY';
+        throw error;
+    }
+
+    function installWindowGetAllVariables() {
+        const core = window.MVU2LEDGER_CORE;
+        if (!core || typeof core.statDataFromTables !== 'function') return;
+        if (!installedGetAllVariables) {
+            // 覆盖前登记真原始值（可能是真 MVU 的函数或桥版；还原时从共享注册表取回）
+            noteGlobalOriginals(window);
+            originalGetAllVariables = window.getAllVariables;
+            installedGetAllVariables = true;
+        }
+        window.getAllVariables = function () {
+            try {
+                // 布局归属校验：切卡空窗期 activeLayout 还是上一张卡的。
+                // 未就绪时先从当前角色即时解析布局（挂载期 autoInit 可能还没跑完），
+                // 仍拿不到才返回空——否则前端空读→schema 默认值→写回会重置数据库。
+                if (!layoutBelongsToCurrentCard(activeLayoutCardKey)) {
+                    if (!ensureActiveLayoutLazy()) {
+                        return unavailableMvuRead({ stat_data: {}, display_data: {} });
+                    }
+                }
+                // SP 已提交回调后的前端刷新窗口：回调 after 比尚未物化完成的
+                // exportTableAsJson() 更新，也是本次 VARIABLE_UPDATE_ENDED 的权威载荷。
+                const committedRead = readFrontendCommittedMvuRead();
+                if (committedRead && committedRead.stat_data) return committedRead;
+                const api = getAcuApi();
+                if (!api || typeof api.exportTableAsJson !== 'function' || !activeLayout) {
+                    try {
+                        const persisted0 = readPersistedTableData();
+                        if (persisted0 && tableSnapshotCoversLayout(persisted0, activeLayout, true)) return statDataFromTablesCached(activeLayout || [], persisted0);
+                    } catch (e) {}
+                    return unavailableMvuRead(core.statDataFromTables(activeLayout || [], {}));
+                }
+                // 运行时优先：插件就绪后运行时即插件完整回放的权威状态（含全部表与溢出字段）。
+                // 持久化重建只是空/跨卡窗口的兜底。“就绪”必须满足当前 layout 的全部表，
+                // 且每张单例/JSON 表都有数据行；只看“任意表有行”会把 V2 replay
+                // 中已物化一部分的半成品当成完整快照。此时若按运行时读，
+                // 单例表会退化成布局默认值（如 当前MC点=0/零花钱=6000），前端读到后既显示又写回；
+                // 必须先等 content 有行，或改用能完整重建的持久化快照。
+                const cur = api.exportTableAsJson() || {};
+                // 切卡隔离必须早于“运行时不完整 → 持久化兜底”：切卡空窗内
+                // 运行时和聊天帧都可能还属于上一张卡，不得用新 layout 投影旧卡快照。
+                try {
+                    const foreign = runtimeForeignTableNames(api, activeLayout);
+                    if (foreign.length) {
+                        const persisted2 = readPersistedTableData();
+                        if (persisted2 && tableSnapshotCoversLayout(persisted2, activeLayout, true)) {
+                            dbg(' [切卡隔离] 运行时含跨卡残留表：' + foreign.join('、') + '，改用当前卡持久化帧。');
+                            return statDataFromTablesCached(activeLayout, persisted2);
+                        }
+                        dbg(' [切卡隔离] 运行时/持久化帧仍属于旧卡，读取返回空。');
+                        return unavailableMvuRead({ stat_data: {}, display_data: {} });
+                    }
+                } catch (e) {}
+                if (!tableSnapshotCoversLayout(cur, activeLayout)) {
+                    const persisted = readPersistedTableData();
+                    if (persisted && tableSnapshotCoversLayout(persisted, activeLayout, true)) return statDataFromTablesCached(activeLayout, persisted);
+                    // 无存档且尚未物化数据行时，读取卡内初始模板。JSON 可选列的
+                    // 空单元格表示字段不存在，不能靠 codec 恢复默认值；已开始的
+                    // 聊天仍按当前表读取，避免复活游玩中删除的字段。
+                    const hasRows = Object.values(cur).some(sheet => sheet && Array.isArray(sheet.content) && sheet.content.length > 1);
+                    const chat = getContextSafe()?.chat;
+                    if (!hasRows && !mvu2ledgerChatHasFullCheckpoint() &&
+                        Array.isArray(chat) && (chat.length === 0 || mvu2ledgerChatIsPristineOpening())) {
+                        const initial = cachedTemplateForCurrentCard();
+                        if (initial) return statDataFromTablesCached(activeLayout, initial);
+                    }
+                    return unavailableMvuRead(statDataFromTablesCached(activeLayout, persisted || cur));
+                }
+                return statDataFromTablesCached(activeLayout, cur);
+            } catch (e) {
+                return unavailableMvuRead({ stat_data: {}, display_data: {} });
+            }
+        };
+        window.getAllVariables.__mvu2ledger = true;
+        dbg(' 扩展侧已定义 window.getAllVariables（读插件表格重建 stat_data）');
+    }
+    function restoreWindowGetAllVariables() {
+        if (!installedGetAllVariables) return;
+        invalidateStatProjectionCache();
+        try {
+            if (window.getAllVariables && window.getAllVariables.__mvu2ledger === true) {
+                // 从共享注册表还原真原始值（绝不把桥版/我们自己顶替回去）
+                const reg = sharedStateWindow.__mvu2ledgerGlobalState;
+                let rec = null;
+                if (reg && Array.isArray(reg.list)) rec = reg.list.find(r => r.w === window);
+                if (rec && rec.hasGav) window.getAllVariables = rec.gav;
+                else delete window.getAllVariables;
+            }
+        } catch (e) {}
+        installedGetAllVariables = false;
+        originalGetAllVariables = undefined;
+    }
+
+    // 表格更新广播：与 MVU 原版一致，数据库一有变动就广播 VARIABLE_UPDATE_ENDED，
+    // 携带更新前后的完整变量。部分 MVU 卡的 Zod/结算监听器会直接读取
+    // before.stat_data，因此即使插件只提供 after，也不能把 before 留空。
+    // 只在本转换器产物的卡上广播（activeLayout 仅对转换卡缓存），其他数据库卡即使触发表格更新也不发 MVU 事件。
+    let lastVariableUpdateSnapshot = null;
+    let lastVariableUpdateChatKey = '';
+    // 历史回放兜底用它区分“当前回退快照以前碰巧广播过”与“本次聊天变更后
+    // 已经由 SP 回调广播过”。只比较 stat_data 指纹无法区分 A→B→A。
+    let variableUpdateDispatchSeq = 0;
+    let pendingLateFrontendUpdate = null;
+    function armLateFrontendUpdate(after, before) {
+        try {
+            pendingLateFrontendUpdate = {
+                chatKey: autoInitChatId(),
+                expiresAt: Date.now() + 10000,
+                after: JSON.parse(JSON.stringify(after)),
+                before: JSON.parse(JSON.stringify(before)),
+            };
+        } catch (e) { pendingLateFrontendUpdate = null; }
+    }
+    function dispatchVariableUpdateEnded(after, before, eventAlreadyEmitted) {
+        try {
+            if (!activeLayout) return;
+            if (!eventAlreadyEmitted && (tableBusinessRunning || (pendingStatWrite != null && pendingStatWriteSession && pendingStatWriteSession.businessEventEmitted))) return;
+            if (after === undefined || after === null) {
+                try { if (typeof window.getAllVariables === 'function') after = window.getAllVariables(); } catch (e) {}
+            }
+            const safeAfter = JSON.parse(JSON.stringify(after || { stat_data: {}, display_data: {}, delta_data: {} }));
+            if (safeAfter.stat_data) delete safeAfter.stat_data.$internal;
+            const chatKey = autoInitChatId();
+            if (lastVariableUpdateChatKey !== chatKey) {
+                lastVariableUpdateChatKey = chatKey;
+                lastVariableUpdateSnapshot = null;
+            }
+            const safeBefore = before && typeof before === 'object'
+                ? before
+                : (lastVariableUpdateSnapshot || safeAfter);
+            // 提交后的广播只提供隔离视图。业务变换由文本周期或有来源的 SP
+            // 提交管线等待并落库；刷新/回放监听不能污染权威读缓存。
+            if (!eventAlreadyEmitted) emitMvuEvent('mag_variable_update_ended', JSON.parse(JSON.stringify(safeAfter)), JSON.parse(JSON.stringify(safeBefore)));
+            // 数据库原生前端常用的兼容事件。转换卡前端可能只监听其中一种，
+            // 同一份权威快照同时广播；事件监听型前端仍由各自的事件名自行去重。
+            emitMvuEvent('shujuku-table-updated', null);
+            variableUpdateDispatchSeq += 1;
+            // 重生成会先删除旧 AI 消息及其状态栏 iframe。变量更新可能在
+            // 新 iframe 挂载前已广播；保留一份 10s 的一次性载荷，新 iframe
+            // 出现后定向时序补发。无 iframe 变化时不会多发事件。
+            armLateFrontendUpdate(safeAfter, safeBefore);
+            try { reentryNotifyFingerprint = chatKey + '|' + canonicalJsonForSync(safeAfter.stat_data || {}); } catch (e) {}
+            try { lastVariableUpdateSnapshot = JSON.parse(JSON.stringify(safeAfter)); }
+            catch (e) { lastVariableUpdateSnapshot = safeAfter; }
+        } catch (e) {}
+    }
+
+    // 事件广播：与 MVU 原版一致，优先走 TH 事件总线（eventEmit，前端 eventOn 监听的就是它）；
+    // 另发同名 CustomEvent + ST eventSource，覆盖 window/parent/top/同源 iframe；
+    // 缺少 ST 事件总线的窗口（如消息 iframe）补一个绑定到同名 CustomEvent 的 eventOn/eventOff 兜底。
+    function installEarlyEventOnFallback(targets) {
+        try {
+            const recordsByWindow = new WeakMap();
+            for (const w of targets || [window, hostWindow]) {
+                if (!w || typeof w.addEventListener !== 'function' || typeof w.eventOn === 'function') continue;
+                if (recordsByWindow.has(w)) continue;
+                const recordsByEvent = new Map();
+                recordsByWindow.set(w, recordsByEvent);
+                const removeRecord = (evName, handler, record) => {
+                    const handlers = recordsByEvent.get(evName);
+                    const records = handlers && handlers.get(handler);
+                    if (!records || !records.has(record)) return;
+                    records.delete(record);
+                    try { w.removeEventListener(evName, record.wrapped); } catch (e2) {}
+                    if (!records.size) handlers.delete(handler);
+                    if (!handlers.size) recordsByEvent.delete(evName);
+                };
+                w.eventOn = (evName, handler) => {
+                    const wrapped = (e) => {
+                        try {
+                            const d = e && e.detail;
+                            if (d && Array.isArray(d.args)) handler(...d.args);
+                            else if (d && Object.prototype.hasOwnProperty.call(d, 'after')) handler(d.after, d.before);
+                            else handler(d);
+                        } catch (err) {}
+                    };
+                    let handlers = recordsByEvent.get(evName);
+                    if (!handlers) recordsByEvent.set(evName, handlers = new Map());
+                    let records = handlers.get(handler);
+                    if (!records) handlers.set(handler, records = new Set());
+                    const record = { wrapped };
+                    records.add(record);
+                    w.addEventListener(evName, wrapped);
+                    return { stop: () => removeRecord(evName, handler, record) };
+                };
+                w.eventOff = (evName, handler) => {
+                    const handlers = recordsByEvent.get(evName);
+                    const records = handlers && handlers.get(handler);
+                    if (!records) return;
+                    for (const record of Array.from(records)) removeRecord(evName, handler, record);
+                };
+                w.eventOn.__mvu2ledgerFallback = true;
+                w.eventOff.__mvu2ledgerFallback = true;
+            }
+        } catch (e) {}
+    }
+    async function emitMvuEvent(name, ...args) {
+        // 广播前先把 shim/getAllVariables 同步到当前所有 iframe：
+        // 即使新 iframe 恰好在 2s 复查和 MutationObserver 之间创建，
+        // 前端在事件回调里读 window.Mvu/getAllVariables 也一定能拿到。
+        if (activeLayout) { try { applyWindowMvuShim(); } catch (e) {} }
+        const targets = getRuntimeWindows();
+        const pending = [];
+        const emitted = [];
+        const invoke = (fn, owner) => {
+            if (typeof fn !== 'function' || emitted.indexOf(fn) !== -1) return false;
+            emitted.push(fn);
+            try { pending.push(Promise.resolve(fn.apply(owner, [name, ...args]))); } catch (e) {}
+            return true;
+        };
+        for (const t of targets) {
+            try { const EC = t.CustomEvent || CustomEvent; t.dispatchEvent(new EC(name, { detail: { args, after: args[0], before: args[1] } })); } catch (e) {}
+        }
+        // TH 注入到主窗口和各 iframe 的 eventEmit 虽然包装函数不同，
+        // 却通常连到同一条全局总线。对每个 target 逐一调用会把
+        // 一次更新放大成数十次；只选一个总线入口。
+        let busEmitted = false;
+        try { busEmitted = invoke(hostWindow.eventEmit, hostWindow) || busEmitted; } catch (e) {}
+        try { if (!busEmitted) busEmitted = invoke(window.eventEmit, window) || busEmitted; } catch (e) {}
+        if (!busEmitted) {
+            for (const t of targets) {
+                try { if (invoke(t.eventEmit, t)) { busEmitted = true; break; } } catch (e) {}
+            }
+        }
+        // 没有 TavernHelper eventEmit 时才回退到 ST eventSource，避免同链双发。
+        if (!busEmitted) {
+            for (const t of targets) {
+                try { if (t.eventSource && invoke(t.eventSource.emit, t.eventSource)) { busEmitted = true; break; } } catch (e) {}
+            }
+            // ST 扩展的总线通常只在 getContext() 中，主窗口不一定暴露 eventSource。
+            // 尚无 TH iframe 发射器时也必须进入同一业务总线并等待其 Promise。
+            if (!busEmitted) {
+                try {
+                    const context = getContextSafe();
+                    const source = context && (context.eventSource || context.event_source);
+                    if (source) invoke(source.emit, source);
+                } catch (e) {}
+            }
+        }
+        installEarlyEventOnFallback(targets);
+        if (pending.length) await Promise.allSettled(pending);
+    }
+
+    // V2 已保存日志是来源凭据；回调本身并不区分业务提交与历史回放。
+    // 只读日志，不修改宿主帧，也不从 fill-start 或时间窗口猜事务归属。
+    function readSpCommitEntries(chat) {
+        const entries = [];
+        for (let index = 0; index < (chat || []).length; index++) {
+            const message = chat[index];
+            let isolated = message && message.TavernDB_ACU_IsolatedData;
+            if (typeof isolated === 'string') { try { isolated = JSON.parse(isolated); } catch (_) { continue; } }
+            if (!isolated || typeof isolated !== 'object') continue;
+            for (const [scope, storage] of Object.entries(isolated)) {
+                const frame = storage && storage.storageFrame;
+                if (!frame || frame.version !== 2 || !Array.isArray(frame.logEntries)) continue;
+                for (const entry of frame.logEntries) {
+                    if (!entry || typeof entry.entryId !== 'string' || !entry.entryId) continue;
+                    entries.push({ id: JSON.stringify([scope, entry.entryId]), scope, entry, index, message });
+                }
+            }
+        }
+        return entries;
+    }
+    function createSpCommitTracker() {
+        let seen = new Set();
+        const businessSources = new Set(['auto_fill', 'manual_fill', 'group_fill', 'manual_crud', 'raw_sql_mutation', 'raw_sql_batch']);
+        return {
+            seed(entries) { seen = new Set(entries.map(record => record.id)); },
+            consume(entries, sheetKeys, allowed) {
+                const fresh = entries.filter(record => !seen.has(record.id));
+                for (const record of entries) seen.add(record.id);
+                if (!allowed) return [];
+                return fresh.filter(({ entry, index }) => businessSources.has(entry.source)
+                    && entry.targetMessageIndex === index
+                    && [...(entry.changedSheetKeys || []), ...(entry.filledSheetKeys || []),
+                        ...(entry.operations || []).map(op => op && op.sheetKey)]
+                        .some(key => sheetKeys.has(key)));
+            },
+        };
+    }
+
+    let tableUpdateHookApi = null;
+    let tableUpdateHookTimer = null;
+    let databaseHistoryPrepareTimer = null;
+    let tableUpdateHookPendingData = null;
+    let tableUpdateHookSession = null;
+    let tableUpdateHookRetryCount = 0;
+    const tableBusinessTracker = createSpCommitTracker();
+    let tableBusinessSession = null;
+    let tableBusinessSnapshot = null;
+    let tableBusinessPending = null;
+    let tableBusinessRunning = false;
+    let tableBusinessRevision = 0;
+    function syncTableBusinessBaseline(data) {
+        if (isRuntimeSessionCurrent(tableBusinessSession)) return;
+        tableBusinessSession = captureRuntimeSession();
+        tableBusinessTracker.seed(readSpCommitEntries(getContextSafe().chat));
+        tableBusinessSnapshot = mvuDataFromCompleteTableSnapshot(data);
+        tableBusinessPending = null;
+        tableBusinessRevision++;
+    }
+    async function applySpBusinessCorrection(data, task, session) {
+        const api = runtimeApiForSession(getAcuApi(), session);
+        const revision = tableBusinessRevision;
+        const beforeJson = JSON.stringify(api.exportTableAsJson());
+        const entries = readSpCommitEntries(getContextSafe().chat);
+        const entryStamp = JSON.stringify(entries.map(record => record.id));
+        const validSource = () => {
+            const chat = getContextSafe().chat || [];
+            return task.entries.every(record => chat[record.index] === record.message)
+                && entryStamp === JSON.stringify(readSpCommitEntries(chat).map(record => record.id));
+        };
+        const assertUnchanged = () => {
+            assertRuntimeSession(session);
+            if (revision !== tableBusinessRevision || !validSource()
+                || JSON.stringify(api.exportTableAsJson()) !== beforeJson) throw new Error('业务监听期间数据库或来源消息已变化，取消旧修正');
+        };
+        const original = mvuDataFromCompleteTableSnapshot(data);
+        if (!original || beforeJson !== JSON.stringify(data)) return false;
+        const after = JSON.parse(JSON.stringify(original));
+        after.display_data = JSON.parse(JSON.stringify(after.stat_data));
+        after.delta_data = {};
+        // SP 不提供逐 MVU 命令的 reason；这里只把变化叶子记录为本轮差量。
+        const delta = (current, prior, display, changes) => {
+            for (const key of new Set([...Object.keys(current || {}), ...Object.keys(prior || {})])) {
+                const value = current && current[key], old = prior && prior[key];
+                if (canonicalJsonForSync(value) === canonicalJsonForSync(old)) continue;
+                if (value && old && typeof value === 'object' && typeof old === 'object' && !Array.isArray(value) && !Array.isArray(old)) {
+                    changes[key] = {}; delta(value, old, display[key], changes[key]);
+                } else display[key] = changes[key] = String(old) + '->' + JSON.stringify(value);
+            }
+        };
+        delta(after.stat_data, task.before && task.before.stat_data, after.display_data, after.delta_data);
+        after.stat_data.$internal = { display_data: after.display_data, delta_data: after.delta_data };
+        await emitMvuEvent('mag_variable_update_ended', after, task.before || original);
+        delete after.stat_data.$internal;
+        assertUnchanged();
+        if (canonicalJsonForSync(original.stat_data) !== canonicalJsonForSync(after.stat_data)) {
+            const chat = getContextSafe().chat || [];
+            let latestAi = chat.length - 1;
+            while (latestAi >= 0 && (!chat[latestAi] || chat[latestAi].is_user)) latestAi--;
+            sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded = (Number(sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded) || 0) + 1;
+            try {
+                if (task.entries.every(record => record.index === latestAi)) {
+                    const candidate = await buildUpdatedTemplateFromStat(activeLayout, original.stat_data, after.stat_data, data);
+                    assertUnchanged();
+                    if (!candidate) throw new Error('业务修正快照构造失败');
+                    const result = await api.importTableAsJson(JSON.stringify(candidate));
+                    if (result !== true && !(result && result.success === true)) throw new Error('瑟瑟台账未接受业务修正快照');
+                } else {
+                    // 公共导入不能指定旧楼。复用真实 writer 在内存规划，只有一次
+                    // CRUD 才提交；多步整笔拒绝，不留下先完成的步骤或移写最新楼。
+                    await commitCurrentReplyBatch(api, original.stat_data, after.stat_data, data, session,
+                        { allowImport: false, assertBeforeCommit: assertUnchanged });
+                }
+                assertRuntimeSession(session);
+            } finally {
+                sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded = Math.max(0, (Number(sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded) || 1) - 1);
+            }
+        }
+        const committed = api.exportTableAsJson();
+        tableBusinessSnapshot = mvuDataFromCompleteTableSnapshot(committed);
+        publishCommittedTableSnapshot(committed, '瑟瑟台账业务修正', true, true);
+        return true;
+    }
+    function tableSnapshotHasSheets(data) {        if (!data || typeof data !== 'object') return false;
+        for (const k in data) {
+            if (k.indexOf('sheet_') === 0 && data[k] && data[k].name) return true;
+        }
+        return false;
+    }
+    function tableSnapshotCoversLayout(data, layout, allowEmptyRows = false) {
+        if (!tableSnapshotHasSheets(data) || !Array.isArray(layout) || !layout.length) return false;
+        const byName = {};
+        for (const k in data) {
+            const sheet = data[k];
+            if (k.indexOf('sheet_') === 0 && sheet && sheet.name) byName[String(sheet.name)] = sheet;
+        }
+        const requirements = {};
+        for (const L of layout) {
+            if (!L || !L.table) continue;
+            const name = String(L.table);
+            requirements[name] = requirements[name] || { row: false };
+            if (L.kind === 'singleton' || L.kind === 'json') requirements[name].row = true;
+        }
+        for (const name of Object.keys(requirements)) {
+            const sheet = byName[name];
+            if (!sheet) return false;
+            if (!Array.isArray(sheet.content) || !sheet.content.length) return false;
+            if (!allowEmptyRows && requirements[name].row && sheet.content.length <= 1) return false;
+        }
+        return true;
+    }
+
+    function mvuDataFromCompleteTableSnapshot(data, messageIndex, allowEmptyRows = false, includeNative = true) {
+        try {
+            if (!activeLayout || !tableSnapshotCoversLayout(data, activeLayout, allowEmptyRows)) return null;
+            const core = window.MVU2LEDGER_CORE;
+            if (!core || typeof core.statDataFromTables !== 'function') return null;
+            const after = core.statDataFromTables(activeLayout, data);
+            return after && after.stat_data ? (includeNative ? nativeStatStorage.merge(after, messageIndex) : after) : null;
+        } catch (e) { return null; }
+    }
+
+    // 所有表格变化共用同一个前端出口：SP 的提交回调、聊天历史回放兜底都必须
+    // 先暂存同一份权威 after，再驱动事件、无副作用的直接重读入口和明确刷新控件。
+    // 整页 body.load/iframe reload 只允许手动执行，避免普通改单元格清空前端局部状态。
+    function publishCommittedTableSnapshot(data, source, force, eventAlreadyEmitted, allowEmptyRows = false) {
+        const after = mvuDataFromCompleteTableSnapshot(data, undefined, allowEmptyRows);
+        if (!after) return false;
+        try {
+            const fp = autoInitChatId() + '|' + canonicalJsonForSync(after.stat_data);
+            if (!force && fp === reentryNotifyFingerprint) {
+                dbg('[' + source + '] 快照未变，已去重。');
+                return false;
+            }
+            reentryNotifyFingerprint = fp;
+            stageFrontendCommittedMvuRead(after);
+            const result = refreshCurrentCardFrontends({
+                after,
+                eventAlreadyEmitted,
+                allowHardReload: false,
+            });
+            dbg('[' + source + '] 已同步前端：直接 ' + result.direct +
+                '、事件 ' + result.event + '、控件 ' + result.control + '。');
+            return true;
+        } catch (e) {
+            dbgWarn(' ' + source + ' 转换/广播快照失败:', e && e.message ? e.message : e);
+            return false;
+        }
+    }
+
+    // 删楼、切 swipe、编辑消息改变的不是某一次 CRUD，而是“剩余聊天历史回放后的
+    // 整体表状态”。SP v8.9.2 会在约 1.2s 后通知回调，但旧版、重载窗口或回调
+    // 容器竞争可能漏掉。记录事件前运行时指纹，随后只接受完整且确实变化的快照；
+    // 回调已经成功广播时用 dispatchSeq 消重，保证 A→B→A 也不会被历史指纹误拦。
+    let chatMutationFrontendSyncGeneration = 0;
+    let chatMutationFrontendSyncState = null;
+    function cancelChatMutationFrontendSync() {
+        chatMutationFrontendSyncGeneration += 1;
+        const state = chatMutationFrontendSyncState;
+        chatMutationFrontendSyncState = null;
+        if (!state || !Array.isArray(state.timers)) return;
+        for (const timer of state.timers) {
+            try { hostWindow.clearTimeout(timer); } catch (e) {}
+        }
+    }
+    function captureCompleteRuntimeTableSnapshot() {
+        try {
+            const api = getAcuApi();
+            if (!api || typeof api.exportTableAsJson !== 'function') return null;
+            const data = api.exportTableAsJson() || {};
+            const after = mvuDataFromCompleteTableSnapshot(data);
+            if (!after) return null;
+            return {
+                data,
+                fingerprint: autoInitChatId() + '|' + canonicalJsonForSync(after.stat_data),
+            };
+        } catch (e) { return null; }
+    }
+    function scheduleChatMutationFrontendSync(reason, forceUnknownBaseline) {
+        let chatKey = '';
+        let cardKey = '';
+        try {
+            chatKey = autoInitChatId();
+            cardKey = cardCacheKey(currentCharacter());
+        } catch (e) {}
+        const now = Date.now();
+        const existing = chatMutationFrontendSyncState;
+        const canMerge = !!(existing && existing.chatKey === chatKey && existing.cardKey === cardKey && existing.expiresAt > now);
+        const captured = canMerge ? null : captureCompleteRuntimeTableSnapshot();
+        let baselineFingerprint = canMerge ? existing.baselineFingerprint : (captured && captured.fingerprint) || '';
+        if (!baselineFingerprint && String(reentryNotifyFingerprint || '').indexOf(chatKey + '|') === 0) {
+            baselineFingerprint = reentryNotifyFingerprint;
+        }
+        const dispatchSeqAtStart = canMerge ? existing.dispatchSeqAtStart : variableUpdateDispatchSeq;
+        const forceUnknown = !!forceUnknownBaseline || !!(canMerge && existing.forceUnknownBaseline);
+
+        cancelChatMutationFrontendSync();
+        const generation = chatMutationFrontendSyncGeneration;
+        const state = {
+            generation,
+            chatKey,
+            cardKey,
+            reason: String(reason || 'chat_mutation'),
+            baselineFingerprint,
+            dispatchSeqAtStart,
+            forceUnknownBaseline: forceUnknown,
+            expiresAt: now + 13000,
+            timers: [],
+        };
+        chatMutationFrontendSyncState = state;
+        const delays = [1600, 3000, 5200, 8000, 12000];
+        const finish = () => {
+            if (chatMutationFrontendSyncState !== state) return;
+            for (const timer of state.timers) {
+                try { hostWindow.clearTimeout(timer); } catch (e) {}
+            }
+            chatMutationFrontendSyncState = null;
+        };
+        delays.forEach((delay, index) => {
+            const timer = hostWindow.setTimeout(() => {
+                if (chatMutationFrontendSyncState !== state || state.generation !== chatMutationFrontendSyncGeneration) return;
+                // 当前业务提交会在落定后统一发布；回放兜底不能抢在它前面
+                // 广播同一后态，使已经等待过的业务结束监听再次执行。
+                if (tableBusinessRunning || (pendingStatWrite != null && pendingStatWriteSession && pendingStatWriteSession.businessEventEmitted)) return;
+                try {
+                    if (autoInitChatId() !== state.chatKey || cardCacheKey(currentCharacter()) !== state.cardKey) {
+                        finish();
+                        return;
+                    }
+                } catch (e) { finish(); return; }
+                const current = captureCompleteRuntimeTableSnapshot();
+                if (!current) return;
+                const changedFromBaseline = !!state.baselineFingerprint && current.fingerprint !== state.baselineFingerprint;
+                const finalUnknownFallback = !state.baselineFingerprint && state.forceUnknownBaseline && index === delays.length - 1;
+                if (!changedFromBaseline && !finalUnknownFallback) return;
+                // 本次聊天事件之后若已经广播了同一 post-replay 快照，说明 SP 主回调成功，
+                // 这里只结束轮询；否则强制发送，允许状态从 B 回到更早广播过的 A。
+                const alreadyDelivered = variableUpdateDispatchSeq > state.dispatchSeqAtStart &&
+                    reentryNotifyFingerprint === current.fingerprint;
+                if (!alreadyDelivered) publishCommittedTableSnapshot(current.data, '聊天回放兜底/' + state.reason, true);
+                else dbg('[聊天回放兜底/' + state.reason + '] 瑟瑟台账回调已同步同一快照。');
+                finish();
+            }, delay);
+            state.timers.push(timer);
+        });
+    }
+
+    // 有些旧式状态栏不监听 VARIABLE_UPDATE_ENDED，只在挂载时或点击自带的
+    // “刷新数据”控件时重读 message 变量。SP 自动填表发生在楼层挂载之后，
+    // 因此仅在已提交的表更新回调后触发这些明确声明的刷新控件。
+    // 不按文本模糊匹配，也不重载 iframe/楼层，避免重置前端局部状态。
+    function refreshExplicitFrontendDataControls(skipWindows) {
+        const skipped = skipWindows || [];
+        const windows = [];
+        const documents = [];
+        const documentOwners = [];
+        const controls = [];
+        const visit = (w) => {
+            try {
+                if (!w || windows.indexOf(w) !== -1) return;
+                windows.push(w);
+                const doc = w.document;
+                if (!doc) return;
+                if (documents.indexOf(doc) === -1) {
+                    documents.push(doc);
+                    documentOwners.push(w);
+                }
+                const frames = typeof doc.querySelectorAll === 'function' ? doc.querySelectorAll('iframe') : [];
+                for (const frame of frames) { try { visit(frame.contentWindow); } catch (e) {} }
+            } catch (e) {}
+        };
+        visit(window); visit(hostWindow);
+        try { visit(window.parent); } catch (e) {}
+        try { visit(window.top); } catch (e) {}
+        const selector = [
+            'button[title="刷新数据"]',
+            '[role="button"][title="刷新数据"]',
+            'button[aria-label="刷新数据"]',
+            'button[title="Refresh data"]',
+            '[role="button"][title="Refresh data"]',
+            'button[aria-label="Refresh data"]',
+            '[data-mvu-refresh]',
+        ].join(',');
+        for (let di = 0; di < documents.length; di++) {
+            const doc = documents[di];
+            const owner = documentOwners[di];
+            try {
+                const found = typeof doc.querySelectorAll === 'function' ? doc.querySelectorAll(selector) : [];
+                for (const control of found) {
+                    if (control && !controls.some(rec => rec.control === control)) controls.push({ control, owner });
+                }
+            } catch (e) {}
+        }
+        let count = 0;
+        for (const rec of controls) {
+            try {
+                const control = rec.control;
+                const owner = rec.owner;
+                if (skipped.indexOf(owner) !== -1) continue;
+                if (control.disabled || typeof control.click !== 'function') continue;
+                control.click();
+                count += 1;
+            } catch (e) {}
+        }
+        if (count) dbg('[前端刷新] 已触发 ' + count + ' 个显式“刷新数据”控件。');
+        return count;
+    }
+
+    function readCardFrontendMode(w) {
+        try {
+            const globalMode = w && w.__mvu2ledgerFrontendMode;
+            if (/^(?:event|direct|control|reload)$/.test(String(globalMode || ''))) return String(globalMode);
+            const doc = w && w.document;
+            const nodes = [doc && doc.documentElement, doc && doc.body];
+            for (const node of nodes) {
+                const mode = node && node.getAttribute && node.getAttribute('data-mvu2ledger-frontend');
+                if (mode) return String(mode);
+            }
+            const scripts = doc && doc.querySelectorAll ? doc.querySelectorAll('script') : [];
+            for (const script of scripts) {
+                if (script.getAttribute && script.getAttribute('src')) continue;
+                const m = String(script.textContent || script.innerHTML || '').match(/__mvu2ledgerFrontendMode\s*=\s*["'](event|direct|control|reload)["']/);
+                if (m) return m[1];
+            }
+        } catch (e) {}
+        return '';
+    }
+
+    async function flushTableUpdateHook() {
+        tableUpdateHookTimer = null;
+        if (tableBusinessRunning) {
+            tableUpdateHookTimer = hostWindow.setTimeout(flushTableUpdateHook, 120);
+            return;
+        }
+        if (!isRuntimeSessionCurrent(tableUpdateHookSession)) {
+            tableUpdateHookPendingData = null;
+            tableUpdateHookSession = null;
+            return;
+        }
+        if (!activeLayout) return;
+        try {
+            if (Number(sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded) > 0) {
+                // 批量 MVU 写入会暂时抑制每个内部 CRUD 的回调。过去这里直接 return，
+                // 恰好重叠的外部表变化也会永久丢通知；保留 pending 快照并等批次结束。
+                if (tableUpdateHookRetryCount < 8) {
+                    tableUpdateHookRetryCount += 1;
+                    tableUpdateHookTimer = hostWindow.setTimeout(flushTableUpdateHook, Math.min(1200, 150 * tableUpdateHookRetryCount));
+                }
+                return;
+            }
+        } catch (e0) {}
+        let data = tableUpdateHookPendingData;
+        tableUpdateHookPendingData = null;
+        try {
+            const currentApi = getAcuApi();
+            // SP 回调参数就是本次提交后的 currentJsonTableData。优先使用它：
+            // 持久化后紧接着的 replay/物化窗口内，exportTableAsJson() 可能短暂
+            // 为空或仍是旧快照，会把有效的前端刷新丢掉。
+            if (!tableSnapshotCoversLayout(data, activeLayout) && currentApi && typeof currentApi.exportTableAsJson === 'function') {
+                data = currentApi.exportTableAsJson() || {};
+            }
+        } catch (e2) { data = data || {}; }
+        // 有完整持久化帧的空表是用户清空后的有效状态；缺表的回放窗口仍等待。
+        let persistedEmpty = false;
+        if (!tableSnapshotCoversLayout(data, activeLayout)) {
+            const persisted = readPersistedTableData();
+            if (tableSnapshotCoversLayout(persisted, activeLayout, true)) {
+                data = persisted;
+                persistedEmpty = true;
+            }
+        }
+        if (!tableSnapshotCoversLayout(data, activeLayout, persistedEmpty)) {
+            if (tableUpdateHookRetryCount < 8) {
+                tableUpdateHookRetryCount += 1;
+                tableUpdateHookTimer = hostWindow.setTimeout(flushTableUpdateHook, Math.min(1200, 300 * tableUpdateHookRetryCount));
+            }
+            return;
+        }
+        tableUpdateHookRetryCount = 0;
+        const task = tableBusinessPending;
+        tableBusinessPending = null;
+        if (task && task.entries.length) {
+            const session = tableUpdateHookSession;
+            tableBusinessRunning = true;
+            try {
+                if (await applySpBusinessCorrection(data, task, session)) return;
+            } catch (e) {
+                dbgWarn(' 瑟瑟台账业务修正未应用：', e && e.message ? e.message : e);
+                // 不自动重跑监听器；重试奖励/扣费会产生二次业务效果。
+                if (!isRuntimeSessionCurrent(session)) return;
+                try { data = getAcuApi().exportTableAsJson(); } catch (_) {}
+                publishCommittedTableSnapshot(data, '瑟瑟台账业务修正取消', true, true);
+                return;
+            } finally { tableBusinessRunning = false; }
+        }
+        publishCommittedTableSnapshot(data, '表格更新回调', false, false, persistedEmpty);
+    }
+    const tableUpdateHookCallback = (latestTableData, meta) => {
+        if (!activeLayout) return;
+        databaseMessageHistory.invalidate();
+        scheduleDatabaseHistoryPreparation();
+        syncTableBusinessBaseline(latestTableData);
+        const currentSnapshot = mvuDataFromCompleteTableSnapshot(latestTableData);
+        const sheetNames = new Set((activeLayout || []).map(layout => layout.table));
+        const sheetKeys = new Set(Object.keys(latestTableData || {}).filter(key => latestTableData[key] && sheetNames.has(latestTableData[key].name)));
+        const allowed = !!(meta && meta.persisted === true) && !(Number(sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded) > 0);
+        const fresh = tableBusinessTracker.consume(readSpCommitEntries(getContextSafe().chat), sheetKeys, allowed);
+        if (fresh.length && currentSnapshot) {
+            tableBusinessPending = { entries: [...(tableBusinessPending ? tableBusinessPending.entries : []), ...fresh],
+                before: tableBusinessPending ? tableBusinessPending.before : tableBusinessSnapshot };
+        }
+        if (currentSnapshot) tableBusinessSnapshot = JSON.parse(JSON.stringify(currentSnapshot));
+        tableBusinessRevision++;
+        tableUpdateHookSession = captureRuntimeSession();
+        // SP 每次事务提交都代表运行时数据已变化（含被抑制广播的批量 CRUD），
+        // 投影缓存必须立即失效。
+        invalidateStatProjectionCache();
+        if (meta && meta.persisted === true) frontendCommittedMvuRead = null;
+        if (tableSnapshotHasSheets(latestTableData)) tableUpdateHookPendingData = latestTableData;
+        tableUpdateHookRetryCount = 0;
+        if (tableUpdateHookTimer) hostWindow.clearTimeout(tableUpdateHookTimer);
+        // 同一填表任务可包含多个内部通知，短防抖只发最后快照。
+        tableUpdateHookTimer = hostWindow.setTimeout(flushTableUpdateHook, 120);
+    };
+    function installTableUpdateHook() {
+        const api = getAcuApi();
+        if (!api || typeof api.registerTableUpdateCallback !== 'function') return false;
+        try {
+            syncTableBusinessBaseline(typeof api.exportTableAsJson === 'function' ? api.exportTableAsJson() : null);
+            if (tableUpdateHookApi && tableUpdateHookApi !== api && typeof tableUpdateHookApi.unregisterTableUpdateCallback === 'function') {
+                try { tableUpdateHookApi.unregisterTableUpdateCallback(tableUpdateHookCallback); } catch (e0) {}
+            }
+            // registerTableUpdateCallback 会按函数引用去重；每次都重申注册，
+            // 可覆盖 SP 在聊天/模板重载时 API 对象未变但内部回调容器已重建的情况。
+            api.registerTableUpdateCallback(tableUpdateHookCallback);
+            tableUpdateHookApi = api;
+            return true;
+        } catch (e) { return false; }
+    }
+
+    function uninstallTableUpdateHook() {
+        if (databaseHistoryPrepareTimer !== null) hostWindow.clearTimeout(databaseHistoryPrepareTimer);
+        databaseHistoryPrepareTimer = null;
+        if (tableUpdateHookApi && typeof tableUpdateHookApi.unregisterTableUpdateCallback === 'function') {
+            try { tableUpdateHookApi.unregisterTableUpdateCallback(tableUpdateHookCallback); } catch (e) {}
+        }
+        if (tableUpdateHookTimer) hostWindow.clearTimeout(tableUpdateHookTimer);
+        tableUpdateHookTimer = null;
+        tableUpdateHookPendingData = null;
+        tableUpdateHookRetryCount = 0;
+        tableUpdateHookSession = null;
+        tableUpdateHookApi = null;
+        tableBusinessSession = null;
+        tableBusinessSnapshot = null;
+        tableBusinessPending = null;
+        tableBusinessRevision++;
+    }
+
+    function refreshCurrentCardFrontends(options) {
+        const opts = options || {};
+        const allowHardReload = opts.allowHardReload !== false;
+        const targets = [];
+        const seen = [];
+        const visit = (w) => {
+            try {
+                if (!w || seen.indexOf(w) !== -1) return;
+                seen.push(w);
+                targets.push(w);
+                const frames = w.document ? w.document.querySelectorAll('iframe') : [];
+                for (const frame of frames) { try { visit(frame.contentWindow); } catch (e) {} }
+            } catch (e) {}
+        };
+        visit(window); visit(hostWindow);
+        try { visit(window.parent); } catch (e) {}
+        try { visit(window.top); } catch (e) {}
+        const result = { direct: 0, event: 0, control: 0, reload: 0 };
+        const occupied = [];
+        const reloadTargets = [];
+        for (const target of targets) {
+            try {
+                const mode = readCardFrontendMode(target);
+                // 已确认只重读数据的内联初始化函数可以安全用于每次表格更新。
+                // body.load 重挂载会清掉页面局部状态，只允许用户手动刷新时调用。
+                if (typeof target.__mvu2ledgerRefreshInlineFrontend === 'function') {
+                    target.__mvu2ledgerRefreshInlineFrontend();
+                    result.direct++;
+                    occupied.push(target);
+                    continue;
+                }
+                if (allowHardReload && typeof target.__mvu2ledgerReloadFrontend === 'function') {
+                    target.__mvu2ledgerReloadFrontend();
+                    result.direct++;
+                    occupied.push(target);
+                    continue;
+                }
+                if (mode === 'event') result.event++;
+                if (mode === 'event') occupied.push(target);
+                else if (allowHardReload && mode === 'reload' && target !== window && target !== hostWindow && target.location && typeof target.location.reload === 'function') reloadTargets.push(target);
+            } catch (e) {}
+        }
+        // 普通状态栏应通过 MVU 原生更新事件刷新；这里也补发一次，
+        // 手动按钮因此同时适用于监听式前端和旧式 body.load 整页前端。
+        dispatchVariableUpdateEnded(opts.after, opts.before, opts.eventAlreadyEmitted);
+        result.control += refreshExplicitFrontendDataControls(occupied.concat(reloadTargets));
+        for (const target of reloadTargets) {
+            try { target.location.reload(); result.reload++; } catch (e) {}
+        }
+        return result;
+    }
+
+    // =================================================================
+    // 扩展侧 Mvu 兼容层：按 MVU 官方全局 API（createMvu）完整实现，
+    // 覆盖式接管运行环境里残留的真 MVU（避免双轨冲突），桥不在主窗口时也能读写数据库。
+    // =================================================================
+    const { parseMvuCommands, mvuCommandInfoFromInternal,
+        mvuInternalFromCommandInfo, applyMvuCommands } =
+        window.__MVU2LEDGER_MVU_COMMANDS_FACTORY__({ getMvuYamlLibs: () => window.__MVU2LEDGER_YAML_LIBS__ });
+
+    async function applyMvuCommandsWithEvents(stat, cmds, display) {
+        const at = (path) => {
+            let cur = stat;
+            for (const p of mvuVariablePathParts(path, stat)) cur = cur == null ? undefined : cur[p];
+            try { return JSON.parse(JSON.stringify(cur)); } catch (e) { return cur; }
+        };
+        for (const cmd of cmds) {
+            const oldValue = at(cmd.path);
+            applyMvuCommands(stat, [cmd], display);
+            const newValue = at(cmd.path);
+            try {
+                if (JSON.stringify(oldValue) !== JSON.stringify(newValue)) {
+                    await emitMvuEvent('mag_variable_updated', stat, cmd.path, oldValue, newValue);
+                }
+            } catch (e) {}
+        }
+    }
+
+    async function runMvuUpdateCycle(message, oldData) {
+        try { openingBulkClosedChats.add(runtimeScopedChatKey(autoInitChatId())); pruneOrderedCollection(openingBulkClosedChats, 80); } catch (e) {}
+        const out = JSON.parse(JSON.stringify(oldData || {}));
+        if (!out.stat_data || typeof out.stat_data !== 'object') out.stat_data = {};
+        const before = JSON.parse(JSON.stringify(out));
+        delete out.stat_data.$internal;
+        out.display_data = JSON.parse(JSON.stringify(out.stat_data));
+        out.delta_data = {};
+        out.stat_data.$internal = { display_data: out.display_data, delta_data: out.delta_data };
+        await emitMvuEvent('mag_variable_update_started', out);
+        const originalMessage = String(message || '');
+        let processedMessage = originalMessage;
+        try {
+            const macroFn = (typeof window.substitudeMacros === 'function' && window.substitudeMacros) || (typeof hostWindow.substitudeMacros === 'function' && hostWindow.substitudeMacros);
+            if (macroFn) processedMessage = String(macroFn(originalMessage));
+        } catch (e) {}
+        const infos = parseMvuCommands(processedMessage).map(mvuCommandInfoFromInternal);
+        await emitMvuEvent('mag_command_parsed', out, infos, originalMessage);
+        if ((readCardApiMetadata().schemaKeys || []).length) await currentCardApi.ready();
+        for (const key of readCardApiMetadata().schemaKeys || []) await emitMvuEvent('mvu2ledger_command_normalize:' + key, out, infos, originalMessage);
+        // 数据库 Schema 已接管类型、CHECK 与行约束。仍按 MVU 顺序
+        // 通知旧 Zod 监听器（保留事件兼容），但对隔离快照执行：
+        // 转换后遗留的外部 Schema 不能再删改真正将要落库的命令。
+        const zodOut = JSON.parse(JSON.stringify(out));
+        const zodInfos = JSON.parse(JSON.stringify(infos));
+        await emitMvuEvent('mag_command_parsed_for_zod', zodOut, zodInfos, originalMessage);
+        await emitMvuEvent('mag_command_parsed_ended_for_zod', zodOut, zodInfos, originalMessage);
+        const commands = infos.map(mvuInternalFromCommandInfo).filter(Boolean);
+        if (commands.length) await applyMvuCommandsWithEvents(out.stat_data, commands, out.display_data);
+        await emitMvuEvent('mag_variable_update_ended', out, before);
+        delete out.stat_data.$internal;
+        const zodEnded = JSON.parse(JSON.stringify(out));
+        const zodBefore = JSON.parse(JSON.stringify(before));
+        await emitMvuEvent('mag_variable_update_ended_for_zod', zodEnded, zodBefore);
+        out.stat_data = await validateCardStat(out.stat_data);
+        if ((readCardApiMetadata().schemaKeys || []).length) out.display_data = JSON.parse(JSON.stringify(out.stat_data));
+        Object.defineProperty(out, '__mvu2ledgerBusinessProcessed', { value: true });
+        return out;
+    }
+
+    // 公共 MVU API 使用 Lodash 路径语义；与 AI 文本命令的路径修正规则分开。
+    function mvuVariablePathParts(path, data) {
+        if (Array.isArray(path)) return path.map(String);
+        const text = String(path == null ? '' : path);
+        if (data != null && Object.prototype.hasOwnProperty.call(Object(data), text)) return [text];
+        const lodash = window._ || hostWindow._;
+        if (lodash && typeof lodash.toPath === 'function') return lodash.toPath(text);
+        // 早期 shim 尚无 Lodash 时也支持数字下标、引号键、转义与空键。
+        const parts = [];
+        if (text[0] === '.') parts.push('');
+        text.replace(/[^.[\]]+|\[(?:(-?\d+(?:\.\d+)?)|(["'])((?:(?!\2)[^\\]|\\.)*?)\2)\]|(?=(?:\.|\[\])(?:\.|\[\]|$))/g,
+            (match, number, quote, quoted) => {
+                parts.push(quote ? quoted.replace(/\\(\\)?/g, '$1') : (number || match));
+                return match;
+            });
+        return parts.length ? parts : [''];
+    }
+
+    let windowMvuShimTimer = null;
+    let windowMvuIframeObserver = null;
+    let windowMvuFake = null;
+    let windowMvuFakeSession = null;
+    let windowMvuExportedEventStops = [];
+    let windowMvuGlobalAnnounced = false;
+    let windowMvuInitializedFunctions = new WeakSet();
+    // 与卡内桥共用的“真原始值”注册表：先接管者（桥或扩展）记录各窗口的原始函数，
+    // 切到其他卡（尤其真 MVU 卡）时都从这里还原——避免把桥/扩展自己的接管函数
+    // 当成“原始值”保存/恢复（这是切卡后函数不还原、真 MVU 卡被污染的根因）。
+    const sharedStateWindow = (() => {
+        try { if (window.top && window.top.document) return window.top; } catch (e) {}
+        try { if (hostWindow && hostWindow.document) return hostWindow; } catch (e) {}
+        return window;
+    })();
+    function isOursShimFn(fn) {
+        return !!(fn && typeof fn === 'function' && (fn.__mvu2ledger || fn.__mvu2ledgerBridge));
+    }
+    const runtimeGlobals = window.__MVU2LEDGER_RUNTIME_GLOBALS_FACTORY__({
+        readSharedState: () => sharedStateWindow.__mvu2ledgerGlobalState
+            || (sharedStateWindow.__mvu2ledgerGlobalState = { list: [] }),
+        isOursShimFn,
+        readFake: () => windowMvuFake,
+    });
+    function noteGlobalOriginals(w) { return runtimeGlobals.note(w); }
+    function restoreGlobalOriginals() { runtimeGlobals.restoreAll(); }
+    let currentCardApi = null;
+    function readCardApiMetadata() {
+        const ch = currentCharacter(); const data = ch && (ch.data || ch);
+        return data && data.extensions && data.extensions.mvu2ledger
+            || (layoutBelongsToCurrentCard(activeLayoutCardKey) ? activeCardApiMetadata : {});
+    }
+    async function validateCardStat(stat, proof) {
+        if (!(readCardApiMetadata().schemaKeys || []).length) return JSON.parse(JSON.stringify(stat || {}));
+        if (!currentCardApi) throw new Error('原卡 Schema 接入尚未就绪，已停止写入');
+        return currentCardApi.validate(stat, proof);
+    }
+    function applyWindowMvuShim() {
+        const shimSession = captureRuntimeSession();
+        const core = window.MVU2LEDGER_CORE;
+        if (!core || typeof core.writeStatDiffToDbResult !== 'function') return;
+        // 只接管本转换器产物的卡。大卡的 TavernHelper 外部 import 可能让
+        // 薄桥/layout 注册晚于开场页的 3s MVU 检测，因此只要当前卡有转换标记就先
+        // 发布 Mvu 外观；真正读写仍由 replaceMvuData 等待 activeLayout/API 就绪。
+        // 其他卡（含真 MVU 卡）绝不覆盖 window.Mvu。避免依赖 currentCharacter()，
+        // 否则角色懒加载缺 extensions 时会把转换卡误判为非转换卡而撤销接管。
+        let currentMarkedConverted = false;
+        try { currentMarkedConverted = isConvertedMvuCard(currentCharacter()); } catch (e) {}
+        if ((!activeLayout || !layoutBelongsToCurrentCard(activeLayoutCardKey)) && !currentMarkedConverted) {
+            restoreWindowMvuShim();
+            return;
+        }
+        if (!windowMvuFake || !isRuntimeSessionCurrent(windowMvuFakeSession)) {
+            windowMvuFake = {};
+            windowMvuFakeSession = shimSession;
+            windowMvuGlobalAnnounced = false;
+            windowMvuInitializedFunctions = new WeakSet();
+            const sessionMvu = windowMvuFake;
+            const sessionCardApi = window.__MVU2LEDGER_CARD_API_FACTORY__({
+                readMetadata: readCardApiMetadata, isCurrent: () => isRuntimeSessionCurrent(shimSession) && currentCardApi === sessionCardApi,
+                readMvu: () => sessionMvu,
+                wait: ms => new Promise(resolve => hostWindow.setTimeout(resolve, ms)),
+                unmapped: stat => readCardApiMetadata().statStorage?.version >= 1 ? [] : core.unmappedStatGroups(activeLayout, {}, stat),
+            });
+            currentCardApi = sessionCardApi;
+            sessionMvu.registerSchema = sessionCardApi.registerSchema;
+            windowMvuFake.__mvu2ledgerFake = true;
+            windowMvuFake.events = {
+                VARIABLE_INITIALIZED: 'mag_variable_initialized',
+                VARIABLE_UPDATE_STARTED: 'mag_variable_update_started',
+                COMMAND_PARSED: 'mag_command_parsed',
+                VARIABLE_UPDATE_ENDED: 'mag_variable_update_ended',
+                BEFORE_MESSAGE_UPDATE: 'mag_before_message_update',
+                SINGLE_VARIABLE_UPDATED: 'mag_variable_updated',
+            };
+            windowMvuFake.getMvuData = function (options) {
+                if (options && options.type && options.type !== 'message') {
+                    const original = noteGlobalOriginals(window);
+                    return original.hasGet ? original.get.call(window, options) : {};
+                }
+                if (options && options.message_id != null && options.message_id !== 'latest') return readDatabaseVariables(options);
+                if (!isRuntimeSessionCurrent(shimSession)) return { stat_data: {}, display_data: {}, delta_data: {}, initialized_lorebooks: {} };
+                // 有待写快照时直接返回，保证 写→读 一致（持久化由合并定时器落库）
+                if (pendingStatWrite) {
+                    return { stat_data: pendingStatWrite, display_data: {}, delta_data: {}, initialized_lorebooks: {} };
+                }
+                const all = window.getAllVariables ? window.getAllVariables() : { stat_data: {} };
+                assertMvuReadReady(all);
+                return { stat_data: all.stat_data || {}, display_data: all.display_data || {}, delta_data: {}, initialized_lorebooks: {} };
+            };
+            windowMvuFake.getMvuVariable = function (mvu_data, path, opts) {
+                try {
+                    opts = opts || {};
+                    const cat = opts.category || 'stat';
+                    const data = cat === 'display' ? (mvu_data && mvu_data.display_data) : cat === 'delta' ? (mvu_data && mvu_data.delta_data) : (mvu_data && mvu_data.stat_data);
+                    const parts = mvuVariablePathParts(path, data);
+                    let cur = data;
+                    for (const p of parts) { if (cur == null) { cur = undefined; break; } cur = cur[p]; }
+                    const v = cur === undefined ? opts.default_value : cur;
+                    return (Array.isArray(v) && v.length === 2 && typeof v[1] === 'string') ? v[0] : v;
+                } catch (e) { return opts && opts.default_value !== undefined ? opts.default_value : undefined; }
+            };
+            windowMvuFake.getRecordFromMvuData = function (mvu_data, category) {
+                if (!mvu_data) return undefined;
+                if (category === 'display') return mvu_data.display_data;
+                if (category === 'delta') return mvu_data.delta_data;
+                return mvu_data.stat_data;
+            };
+            windowMvuFake.setMvuVariable = async function (mvu_data, path, new_value, opts) {
+                try {
+                    opts = opts || {};
+                    if (!mvu_data || typeof mvu_data !== 'object') return false;
+                    if (!mvu_data.stat_data || typeof mvu_data.stat_data !== 'object') mvu_data.stat_data = {};
+                    const parts = mvuVariablePathParts(path, mvu_data.stat_data);
+                    if (!parts.length || parts.some(p => p === '__proto__' || p === 'constructor' || p === 'prototype')) return false;
+                    const hasObjPath = (obj, arr) => { let c = obj; for (const p of arr) { if (c == null || !Object.prototype.hasOwnProperty.call(Object(c), p)) return false; c = c[p]; } return true; };
+                    const setObjPath = (obj, arr, v) => { let c = obj; for (let i = 0; i < arr.length - 1; i++) { if (c[arr[i]] == null || typeof c[arr[i]] !== 'object') c[arr[i]] = /^\d+$/.test(arr[i + 1]) ? [] : {}; c = c[arr[i]]; } c[arr[arr.length - 1]] = v; };
+                    // 与官方 updateVariable 一致：路径不存在时不写（返回 false），不自动创建
+                    if (!hasObjPath(mvu_data.stat_data, parts)) return false;
+                    const display_data = mvu_data.stat_data.$internal && mvu_data.stat_data.$internal.display_data;
+                    const delta_data = mvu_data.stat_data.$internal && mvu_data.stat_data.$internal.delta_data;
+                    const curPath = (() => { let c = mvu_data.stat_data; for (let i = 0; i < parts.length - 1; i++) { c = c[parts[i]]; } return c; })();
+                    const lastKey = parts[parts.length - 1];
+                    const previousValue = curPath[lastKey];
+                    const isVWD = Array.isArray(previousValue) && previousValue.length === 2 && typeof previousValue[1] === 'string';
+                    const cloneForEvent = value => {
+                        if (value === undefined || value === null || typeof value !== 'object') return value;
+                        try { if (typeof structuredClone === 'function') return structuredClone(value); } catch (e) {}
+                        try { return JSON.parse(JSON.stringify(value)); } catch (e) { return value; }
+                    };
+                    const oldVal = isVWD ? cloneForEvent(previousValue[0]) : previousValue;
+                    const finalValue = new_value;
+                    if (isVWD) {
+                        curPath[lastKey] = [finalValue, previousValue[1]];
+                    } else {
+                        curPath[lastKey] = finalValue;
+                    }
+                    const reason = opts.reason || '';
+                    const ds = String(oldVal) + '->' + JSON.stringify(finalValue) + (reason ? ' (' + reason + ')' : '');
+                    if (display_data) { try { setObjPath(display_data, parts, ds); } catch (e) {} }
+                    if (delta_data) { try { setObjPath(delta_data, parts, ds); } catch (e) {} }
+                    dbg(' Mvu.setMvuVariable:', path, '=', String(new_value) + (reason ? ' (' + reason + ')' : ''));
+                    if (opts.is_recursive) {
+                        await emitMvuEvent('mag_variable_updated', mvu_data.stat_data, path, oldVal, finalValue);
+                    }
+                    return true;
+                } catch (e) {
+                    dbgWarn(' Mvu.setMvuVariable 异常:', e);
+                    return false;
+                }
+            };
+            const waitForRuntimeBasics = async (timeoutMs) => {
+                const start = Date.now();
+                let originKey = '';
+                try { originKey = autoInitChatId(); } catch (e) {}
+                while (Date.now() - start < timeoutMs) {
+                    try {
+                        // 等待期间聊天被切换：目标快照属于旧聊天，立即放弃，
+                        // 避免就绪判定命中的是新卡 API 后把旧卡数据交给写路径。
+                        if (!isRuntimeSessionCurrent(shimSession) || (originKey && autoInitChatId() !== originKey)) return false;
+                        const apiNow = getAcuApi();
+                        if (apiNow && activeLayout && layoutBelongsToCurrentCard(activeLayoutCardKey)) return true;
+                    } catch (e) {}
+                    await new Promise(r => hostWindow.setTimeout(r, 250));
+                }
+                return false;
+            };
+            windowMvuFake.replaceMvuData = async function (data, options) {
+                try {
+                    if (options && options.type && options.type !== 'message') {
+                        const original = noteGlobalOriginals(window);
+                        return original.hasRep ? await original.rep.call(window, data, options) : false;
+                    }
+                    assertDatabaseMessageWrite(options);
+                    const callerSession = bindWriteTarget(shimSession);
+                    assertRuntimeSession(callerSession);
+                    let api = getAcuApi();
+                    if (!api || !activeLayout) {
+                        // 外部 UI/开场脚本可能在自动建表完成前就调用写库：不要直接失败，
+                        // 等待布局/API 就绪后再继续（最长约 10 秒，避免 UI 永久卡住）。
+                        const ready = await waitForRuntimeBasics(10000);
+                        assertRuntimeSession(callerSession);
+                        if (!ready) {
+                            dbgWarn(' Mvu.replaceMvuData 被跳过：等待 10s 后 API/布局仍未就绪（api=' + !!api + ' activeLayout=' + (activeLayout ? '有' : '空') + '，自动建表尚未缓存布局，或当前卡不是转换产物）');
+                            return false;
+                        }
+                        api = getAcuApi();
+                        if (!api) return false;
+                    }
+                    overlayFlushRetries = 0;
+                    if (mvu2ledgerDebugOn()) {
+                        // 诊断：记录 replaceMvuData 的调用来源（前端 iframe/桥/卡内脚本），
+                        // 用于区分“用户操作写库”与“前端渲染/填表窗口自动写库”。
+                        let caller = '';
+                        try {
+                            const st = new Error().stack || '';
+                            const lines2 = String(st).split('\n').filter(l => l.indexOf('mvu2ledger') === -1 && l.indexOf('scheduleWindowStatOverlay') === -1);
+                            if (lines2.length) caller = String(lines2[0]).trim();
+                        } catch (e) {}
+                        const g0 = data && data.stat_data ? Object.keys(data.stat_data).filter(k => k !== '$internal') : [];
+                        dbg(' Mvu.replaceMvuData 调用来源=' + (caller || '未知') + ' | 顶层组=' + g0.join(','));
+                    }
+                    const nextStat = (data && data.stat_data) || {};
+                    const writeChatKey = autoInitChatId();
+                    const writeSession = { ...callerSession, businessEventEmitted: !!(data && data.__mvu2ledgerBusinessProcessed),
+                        schemaProof: currentCardApi && currentCardApi.proofOf(nextStat), rawAuthorWrite: true };
+                    const ok = await scheduleWindowStatOverlay(nextStat, null, false, false, writeChatKey, writeSession);
+                    return !!ok;
+                } catch (e) {
+                    dbgWarn(' Mvu.replaceMvuData 异常:', e);
+                    return false;
+                }
+            };
+            windowMvuFake.parseMessage = async function (message, old_data) {
+                try {
+                    assertRuntimeSession(shimSession);
+                    return await runMvuUpdateCycle(message, old_data);
+                } catch (e) {
+                    dbgWarn(' Mvu.parseMessage 异常:', e);
+                    return undefined;
+                }
+            };
+            windowMvuFake.reloadInitVar = async function (mvu_data) {
+                try {
+                    assertRuntimeSession(shimSession);
+                    const core = window.MVU2LEDGER_CORE;
+                    const tpl = cachedTemplateForCurrentCard();
+                    if (!mvu_data || !core || typeof core.statDataFromTables !== 'function' || !activeLayout || !tpl) return false;
+                    const initial = core.statDataFromTables(activeLayout, tpl) || {};
+                    mvu_data.stat_data = JSON.parse(JSON.stringify(initial.stat_data || {}));
+                    mvu_data.display_data = JSON.parse(JSON.stringify(initial.display_data || initial.stat_data || {}));
+                    mvu_data.delta_data = {};
+                    mvu_data.initialized_lorebooks = mvu_data.initialized_lorebooks || {};
+                    return true;
+                } catch (e) { return false; }
+            };
+            windowMvuFake.getCurrentMvuData = function () { return sessionMvu.getMvuData({ type: 'message', message_id: 'latest' }); };
+            windowMvuFake.replaceCurrentMvuData = async function (mvu_data) { return sessionMvu.replaceMvuData(mvu_data, { type: 'message', message_id: 'latest' }); };
+            windowMvuFake.isDuringExtraAnalysis = function () { return false; };
+        }
+        const sessionReadMvu = windowMvuFake;
+        const targets = getRuntimeWindows();
+        runtimeGlobals.retainWindows(targets);
+        for (const w of targets) {
+            try {
+                // 覆盖前先登记真原始值（Mvu/getAllVariables/三个全局函数），
+                // 切卡还原时从共享注册表取回，绝不把桥/扩展自己的接管当原始值。
+                const originalRec = noteGlobalOriginals(w);
+                if (w.TavernHelper && w.TavernHelper.__mvu2ledgerCardApi !== currentCardApi) {
+                    const helper = currentCardApi.facade(runtimeGlobals.original(w, 'TavernHelper'), {
+                        includeAliases: w !== window && w !== hostWindow,
+                    });
+                    Object.defineProperty(helper, '__mvu2ledgerCardApi', { value: currentCardApi });
+                    runtimeGlobals.patch(w, 'TavernHelper', helper);
+                }
+                currentCardApi.patchWorldbookGlobals(w, runtimeGlobals, {
+                    includeAliases: w !== window && w !== hostWindow,
+                });
+                if (typeof w.createChatMessages === 'function' && w.createChatMessages.__mvu2ledgerCardApi !== currentCardApi) {
+                    const create = currentCardApi.wrapCreate(runtimeGlobals.original(w, 'createChatMessages'), w);
+                    create.__mvu2ledger = true; create.__mvu2ledgerCardApi = currentCardApi; runtimeGlobals.patch(w, 'createChatMessages', create);
+                }
+                // 旧 MVU 状态栏常直接读 getChatMessages(id)[0].data.stat_data，
+                // 而数据库不再把当前状态物理存入消息 data。只在读取结果的
+                // 浅副本上投影 stat_data，不污染真实聊天消息，并兼容同步/异步 TH API。
+                if (originalRec && originalRec.hasMsg && !isOursShimFn(w.getChatMessages)) {
+                    const messageReadDefine = function () {
+                        assertRuntimeSession(shimSession);
+                        const result = originalRec.msg.apply(this, arguments);
+                        const decorate = (list) => {
+                            assertRuntimeSession(shimSession);
+                            if (!Array.isArray(list)) return list;
+                            return list.map((item) => {
+                                // The helper's ordinary result has message_id/data.
+                                // include_swipes returns a different shape; do not
+                                // invent independent state for unselected swipes.
+                                if (!item || !Number.isInteger(item.message_id) || !Object.prototype.hasOwnProperty.call(item, 'data')) return item;
+                                const target = ejsEvalBridge.selectMessage({ withMsg: { id: item.message_id, swipe_id: item.swipe_id } });
+                                const wrap = target.missing ? {} : readDatabaseVariables({ type: 'message', message_id: target.index });
+                                const stat = wrap.stat_data || {};
+                                return Object.assign({}, item, { data: Object.assign({}, item.data || {}, {
+                                    stat_data: stat, display_data: wrap.display_data || stat,
+                                }) });
+                            });
+                        };
+                        return result && typeof result.then === 'function' ? result.then(async list => {
+                            assertRuntimeSession(shimSession);
+                            const indices = Array.isArray(list) ? list.filter(item => Number.isInteger(item?.message_id)
+                                && Object.prototype.hasOwnProperty.call(item, 'data')).map(item => item.message_id) : [];
+                            if (indices.length) await databaseMessageHistory.prepare(indices);
+                            return decorate(list);
+                        }) : decorate(result);
+                    };
+                    messageReadDefine.__mvu2ledger = true;
+                    w.getChatMessages = messageReadDefine;
+                }
+                const oldM = w.Mvu;
+                if (oldM && typeof oldM === 'object' && oldM !== windowMvuFake) {
+                    const SKIP = { getMvuData: 1, replaceMvuData: 1, setMvuVariable: 1, getMvuVariable: 1, getRecordFromMvuData: 1, parseMessage: 1, reloadInitVar: 1, getCurrentMvuData: 1, replaceCurrentMvuData: 1, registerSchema: 1, isDuringExtraAnalysis: 1, events: 1 };
+                    for (const pk in oldM) {
+                        if (!Object.prototype.hasOwnProperty.call(oldM, pk)) continue;
+                        if (SKIP[pk]) continue;
+                        if (windowMvuFake[pk] === undefined) windowMvuFake[pk] = oldM[pk];
+                    }
+                }
+                runtimeGlobals.publishMvu(w, windowMvuFake);
+                // API 外观存在不等于数据已加载。等待当前聊天的完整快照，
+                // 再让作者脚本开始读改写；其他全局名称仍委派宿主。
+                if (originalRec && originalRec.hasWait) {
+                    const waitFn = function (name) {
+                        if (String(name) === 'Mvu') {
+                            return (async () => {
+                                while (isRuntimeSessionCurrent(shimSession)) {
+                                    const all = window.getAllVariables && window.getAllVariables();
+                                    if (all && all.__mvu2ledgerReadUnavailable !== true) {
+                                        const messageId = typeof w.getCurrentMessageId === 'function' ? w.getCurrentMessageId() : undefined;
+                                        await prepareDatabaseHistory({ message_id: messageId });
+                                        if (!isRuntimeSessionCurrent(shimSession)) throw new Error('MVU 所属聊天已切换，已取消等待');
+                                        runtimeGlobals.publishMvu(w, sessionReadMvu);
+                                        return sessionReadMvu;
+                                    }
+                                    await new Promise(resolve => hostWindow.setTimeout(resolve, 100));
+                                }
+                                throw new Error('MVU 所属聊天已切换，已取消等待');
+                            })();
+                        }
+                        return originalRec.wait.apply(w, arguments);
+                    };
+                    waitFn.__mvu2ledger = true;
+                    w.waitGlobalInitialized = waitFn;
+                }
+                // 前端状态栏直接调 window.getAllVariables()：把扩展侧读取函数同步到
+                // 消息 iframe/子窗口，否则 iframe 里没有该函数，前端永远读不到数据。
+                if (typeof window.getAllVariables === 'function' && w.getAllVariables !== window.getAllVariables) {
+                    w.getAllVariables = window.getAllVariables;
+                }
+                // 与 MVU/TH 生态一致：接管裸全局 getVariables / updateVariablesWith /
+                // replaceVariables / insertOrAssignVariables（游戏逻辑脚本常直接调用，如 人妻公寓 的
+                // updateVariablesWith(t => …)）。必须是“接管式”而不是“缺省才补”：
+                // 若宿主（旧酒馆助手 TH）已定义这些全局，卡脚本直接调用会走 TH 自己的
+                // 变量存储，读写不到数据库，前端自然读不到数据/两边不同步。
+                // 只接管默认/消息作用域中的 stat_data。chat / character / global /
+                // preset / script / extension 是 TavernHelper 自身的独立存储，必须原样委派。
+                // 消息作用域中的其他辅助键也与数据库视图合并，供动态正则/卡内 UI 使用。
+                const isDbVariableScope = (opts) => !opts || !opts.type || String(opts.type) === 'message';
+                const cloneRecord = (value) => {
+                    try { return value && typeof value === 'object' ? JSON.parse(JSON.stringify(value)) : {}; }
+                    catch (e) { return value && typeof value === 'object' ? Object.assign({}, value) : {}; }
+                };
+                const stripDbVariableKeys = (value) => {
+                    const out = cloneRecord(value);
+                    delete out.stat_data;
+                    delete out.display_data;
+                    delete out.delta_data;
+                    delete out.initialized_lorebooks;
+                    return out;
+                };
+                const readOriginalVariables = (opts) => {
+                    try {
+                        return originalRec && originalRec.hasGet
+                            ? (originalRec.get.call(w, opts) || {})
+                            : {};
+                    } catch (e) { return {}; }
+                };
+                // 原消息现在保存独立的原生状态。辅助变量整份替换先保留它，
+                // 真正的 stat_data 变更仍由既有暂存/数据库提交/回滚流程接管。
+                const auxiliaryWithNativeState = (auxiliary, opts) => {
+                    if (!(readCardApiMetadata().statStorage?.version >= 1)) return auxiliary;
+                    const target = databaseVariableTarget(opts, false);
+                    return { ...auxiliary, stat_data: nativeStatStorage.read(target.index) };
+                };
+                const makeGetVariables = (opts) => {
+                    try {
+                        if (!isDbVariableScope(opts)) {
+                            return originalRec && originalRec.hasGet
+                                ? originalRec.get.call(w, opts)
+                                : {};
+                        }
+                        const auxiliary = readOriginalVariables(opts);
+                        const dbView = readDatabaseVariables(opts);
+                        return Object.assign({}, auxiliary, dbView);
+                    } catch (e) {
+                        if (e && (e.code === 'MVU_DATA_NOT_READY' || String(e.code || '').startsWith('MVU_HISTORY'))) throw e;
+                        return { stat_data: {} };
+                    }
+                };
+                const gvFn = function (opts) { return makeGetVariables(opts); };
+                gvFn.__mvu2ledger = true;
+                w.getVariables = gvFn;
+                prepareDatabaseHistory().catch(error => dbgWarn(' 前端历史状态准备失败:', error));
+                const deepEqualCanon = (a, b) => {
+                    if (a === b) return true;
+                    if (typeof a !== typeof b) return false;
+                    if (a === null || b === null) return a === b;
+                    if (Array.isArray(a) || Array.isArray(b)) {
+                        if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+                        for (let i = 0; i < a.length; i++) if (!deepEqualCanon(a[i], b[i])) return false;
+                        return true;
+                    }
+                    if (typeof a === 'object') {
+                        const ka = Object.keys(a).sort();
+                        const kb = Object.keys(b).sort();
+                        if (ka.length !== kb.length) return false;
+                        for (let i = 0; i < ka.length; i++) {
+                            if (ka[i] !== kb[i]) return false;
+                            if (!deepEqualCanon(a[ka[i]], b[kb[i]])) return false;
+                        }
+                        return true;
+                    }
+                    return a === b;
+                };
+                const updFn = async function (updater, opts) {
+                    try {
+                        if (typeof updater !== 'function') return false;
+                        if (!isDbVariableScope(opts)) {
+                            return originalRec && originalRec.hasUpd
+                                ? await originalRec.upd.call(w, updater, opts)
+                                : false;
+                        }
+                        assertRuntimeSession(shimSession);
+                        assertDatabaseMessageWrite(opts);
+                        const all = window.getAllVariables ? window.getAllVariables() : { stat_data: {} };
+                        if (!pendingStatWrite) assertMvuReadReady(all);
+                        const base = (pendingStatWrite && typeof pendingStatWrite === 'object')
+                            ? pendingStatWrite
+                            : (all.stat_data || {});
+                        const next = JSON.parse(JSON.stringify(base));
+                        const wrapper = Object.assign({}, readOriginalVariables(opts), {
+                            stat_data: next,
+                            display_data: all.display_data || {},
+                            delta_data: all.delta_data || {},
+                            initialized_lorebooks: all.initialized_lorebooks || {},
+                        });
+                        const result = await Promise.resolve(updater(wrapper)) || wrapper;
+                        assertRuntimeSession(shimSession);
+                        const nextStat = result.stat_data || wrapper.stat_data || {};
+                        const oldAux = stripDbVariableKeys(readOriginalVariables(opts));
+                        const nextAux = stripDbVariableKeys(result);
+                        if (!deepEqualCanon(nextAux, oldAux) && originalRec && originalRec.hasRep) {
+                            await Promise.resolve(originalRec.rep.call(w, auxiliaryWithNativeState(nextAux, opts), opts));
+                            assertRuntimeSession(shimSession);
+                        }
+                        // 无变化不写库、不发事件：外部 UI 的自动清理/回写 effect 经常重复写相同数据，
+                        // 如果每次都落库会触发 VARIABLE_UPDATE_ENDED → 前端刷新 → 再写 → 死循环。
+                        if (!deepEqualCanon(nextStat, base)) {
+                            const saved = await windowMvuFake.replaceMvuData({
+                                stat_data: nextStat,
+                                display_data: result.display_data || all.display_data || {},
+                                delta_data: result.delta_data || all.delta_data || {},
+                                initialized_lorebooks: result.initialized_lorebooks || all.initialized_lorebooks || {},
+                            }, opts);
+                            if (!saved) return false;
+                        }
+                        return result;
+                    } catch (e) {
+                        dbgWarn(' updateVariablesWith 异常:', e);
+                        return false;
+                    }
+                };
+                updFn.__mvu2ledger = true;
+                w.updateVariablesWith = updFn;
+                const repFn = async function (variables, opts) {
+                    try {
+                        if (!isDbVariableScope(opts)) {
+                            return originalRec && originalRec.hasRep
+                                ? await Promise.resolve(originalRec.rep.call(w, variables, opts))
+                                : false;
+                        }
+                        assertRuntimeSession(shimSession);
+                        const input = variables && typeof variables === 'object' ? variables : {};
+                        if (Object.prototype.hasOwnProperty.call(input, 'stat_data')) assertDatabaseMessageWrite(opts);
+                        if (originalRec && originalRec.hasRep) {
+                            await Promise.resolve(originalRec.rep.call(w, Object.prototype.hasOwnProperty.call(input, 'stat_data')
+                                ? auxiliaryWithNativeState(stripDbVariableKeys(input), opts) : stripDbVariableKeys(input), opts));
+                            assertRuntimeSession(shimSession);
+                        }
+                        if (Object.prototype.hasOwnProperty.call(input, 'stat_data')) {
+                            if (!await windowMvuFake.replaceMvuData(input, opts)) return false;
+                        }
+                        return input;
+                    } catch (e) {
+                        dbgWarn(' replaceVariables 异常:', e);
+                        return false;
+                    }
+                };
+                repFn.__mvu2ledger = true;
+                w.replaceVariables = repFn;
+                const insFn = async function (variables, opts) {
+                    try {
+                        if (!isDbVariableScope(opts)) {
+                            return originalRec && originalRec.hasIns
+                                ? await Promise.resolve(originalRec.ins.call(w, variables, opts))
+                                : false;
+                        }
+                        assertRuntimeSession(shimSession);
+                        const input = variables && typeof variables === 'object' ? variables : {};
+                        if (Object.prototype.hasOwnProperty.call(input, 'stat_data')) assertDatabaseMessageWrite(opts);
+                        const auxiliary = stripDbVariableKeys(input);
+                        if (Object.keys(auxiliary).length && originalRec && originalRec.hasIns) {
+                            await Promise.resolve(originalRec.ins.call(w, auxiliary, opts));
+                            assertRuntimeSession(shimSession);
+                        }
+                        if (Object.prototype.hasOwnProperty.call(input, 'stat_data')) {
+                            const all = makeGetVariables(opts);
+                            const saved = await windowMvuFake.replaceMvuData({
+                                stat_data: input.stat_data || {},
+                                display_data: all.display_data || {},
+                                delta_data: all.delta_data || {},
+                                initialized_lorebooks: all.initialized_lorebooks || {},
+                            }, opts);
+                            if (!saved) return false;
+                        }
+                        return makeGetVariables(opts);
+                    } catch (e) {
+                        dbgWarn(' insertOrAssignVariables 异常:', e);
+                        return false;
+                    }
+                };
+                insFn.__mvu2ledger = true;
+                w.insertOrAssignVariables = insFn;
+                // 前端状态栏在消息 iframe 里用 eventOn(Mvu.events.VARIABLE_UPDATE_ENDED, ...) 监听刷新。
+                // 若 iframe 没有 TH 注入的 eventOn，就补一个绑定到 CustomEvent 的兜底，
+                // 这样 emitMvuEvent 的 dispatchEvent 一定能触发前端刷新（不会因事件源不一致而收不到）。
+                if (typeof w.addEventListener === 'function' && typeof w.eventOn !== 'function') {
+                    if (originalRec) { originalRec.eventOn = w.eventOn; originalRec.eventOff = w.eventOff; }
+                    const subscriptions = new Set();
+                    w.eventOn = (evName, handler) => {
+                        evName = String(evName);
+                        const wrapped = (e) => {
+                            try {
+                                const d = e && e.detail;
+                                if (d && Object.prototype.hasOwnProperty.call(d, 'after')) handler(d.after, d.before);
+                                else handler(d);
+                            } catch (err) {}
+                        };
+                        w.addEventListener(evName, wrapped);
+                        const entry = { evName, handler, stop: () => {
+                            try { w.removeEventListener(evName, wrapped); } catch (e2) {}
+                            subscriptions.delete(entry);
+                        } };
+                        subscriptions.add(entry);
+                        return { stop: entry.stop };
+                    };
+                    w.eventOff = (evName, handler) => {
+                        for (const entry of Array.from(subscriptions)) {
+                            if (entry.evName === String(evName) && entry.handler === handler) entry.stop();
+                        }
+                    };
+                    w.eventOn.__mvu2ledgerStopAll = () => {
+                        for (const entry of Array.from(subscriptions)) entry.stop();
+                    };
+                    w.eventOn.__mvu2ledgerFallback = true;
+                    w.eventOff.__mvu2ledgerFallback = true;
+                }
+            } catch (e) {}
+        }
+        // waitGlobalInitialized('Mvu') 不只检查 window.Mvu：酒馆助手的正式共享协议
+        // 需要 initializeGlobal，MVU 原版同时发送 global_Mvu_initialized。
+        // 两步都补齐；函数引用去重，避免多个 iframe 包装指向同一总线时重复注册。
+        const readyRead = window.getAllVariables && window.getAllVariables();
+        if (!readyRead || readyRead.__mvu2ledgerReadUnavailable === true) return;
+        for (const w of targets) {
+            try {
+                const init = w && w.initializeGlobal;
+                if (typeof init === 'function' && !windowMvuInitializedFunctions.has(init)) {
+                    windowMvuInitializedFunctions.add(init);
+                    init.call(w, 'Mvu', windowMvuFake);
+                }
+            } catch (e) {}
+        }
+        if (!windowMvuGlobalAnnounced) {
+            windowMvuGlobalAnnounced = true;
+            for (const w of targets) {
+                try {
+                    if (typeof w.dispatchEvent === 'function') {
+                        const EC = w.CustomEvent || CustomEvent;
+                        w.dispatchEvent(new EC('global_Mvu_initialized', { detail: { args: [] } }));
+                    }
+                } catch (e) {}
+            }
+            let announcedOnBus = false;
+            for (const w of targets) {
+                try {
+                    if (!announcedOnBus && typeof w.eventEmit === 'function') {
+                        w.eventEmit('global_Mvu_initialized');
+                        announcedOnBus = true;
+                    }
+                } catch (e) {}
+            }
+        }
+    }
+    // 撤销 Mvu 接管：恢复各窗口原 window.Mvu，停止周期复查，切回转换卡时再接管。
+    function restoreWindowMvuShim() {
+        currentCardApi = null;
+        windowMvuFakeSession = null;
+        if (runtimeWindows) runtimeWindows.invalidate();
+        pendingLateFrontendUpdate = null;
+        if (windowMvuShimTimer) {
+            hostWindow.clearInterval(windowMvuShimTimer);
+            windowMvuShimTimer = null;
+        }
+        if (windowMvuIframeObserver) {
+            try { windowMvuIframeObserver.disconnect(); } catch (e) {}
+            windowMvuIframeObserver = null;
+        }
+        for (const stop of windowMvuExportedEventStops.splice(0, windowMvuExportedEventStops.length)) {
+            try { if (typeof stop === 'function') stop(); else if (stop && typeof stop.stop === 'function') stop.stop(); } catch (e) {}
+        }
+        // 统一从共享注册表还原“真原始值”（只动我们自己的接管，不碰真 MVU 新挂的函数）。
+        restoreGlobalOriginals();
+        windowMvuGlobalAnnounced = false;
+        windowMvuInitializedFunctions = new WeakSet();
+    }
+    function installMvuExportedEventHandlers() {
+        if (windowMvuExportedEventStops.length || !windowMvuFake) return;
+        let on = null;
+        try { if (typeof hostWindow.eventOn === 'function') on = hostWindow.eventOn.bind(hostWindow); } catch (e) {}
+        try { if (!on && typeof window.eventOn === 'function') on = window.eventOn.bind(window); } catch (e) {}
+        if (!on) return;
+        try {
+            // MagVarUpdate/src/function/exported_events.ts: handleVariablesInCallback
+            const invokeHandle = on('mag_invoke_mvu', async (messageContent, variableInfo) => {
+                if (!variableInfo || variableInfo.old_variables === undefined) return undefined;
+                const next = await runMvuUpdateCycle(String(messageContent || ''), variableInfo.old_variables);
+                variableInfo.new_variables = next;
+                return next;
+            });
+            if (invokeHandle) windowMvuExportedEventStops.push(invokeHandle);
+            // 对外 UPDATE_VARIABLE 的参数就是 updateVariable(stat_data,path,value,reason,is_recursive)。
+            const updateHandle = on('mag_update_variable', async (statData, path, newValue, reason, isRecursive) => {
+                if (!statData || typeof statData !== 'object') return false;
+                return await windowMvuFake.setMvuVariable(
+                    { stat_data: statData, display_data: {}, delta_data: {}, initialized_lorebooks: {} },
+                    path,
+                    newValue,
+                    { reason: reason || '', is_recursive: !!isRecursive }
+                );
+            });
+            if (updateHandle) windowMvuExportedEventStops.push(updateHandle);
+        } catch (e) {
+            dbgWarn(' MVU 对外事件接口安装失败:', e && e.message ? e.message : e);
+        }
+    }
+    function installWindowMvuShim() {
+        applyWindowMvuShim();
+        installMvuExportedEventHandlers();
+        installTableUpdateHook();
+        if (!windowMvuShimTimer) {
+            // 真 MVU 可能异步 import 后重新挂载 window.Mvu；周期复查接管（2s），并监听其初始化事件立即接管
+            windowMvuShimTimer = hostWindow.setInterval(() => {
+                try { applyWindowMvuShim(); } catch (e) {}
+                // SP 可能比本扩展晚加载，或在聊天切换时重建回调容器。
+                // 用同一函数引用重申注册，API 自身去重，不会放大事件。
+                try { installTableUpdateHook(); } catch (e) {}
+            }, 2000);
+            try { if (typeof hostWindow.eventOn === 'function') hostWindow.eventOn('global_Mvu_initialized', () => { try { applyWindowMvuShim(); } catch (e) {} }); } catch (e) {}
+        }
+        if (!windowMvuIframeObserver) {
+            // 新消息楼层 iframe 是渲染时才创建的，仅靠 2s 复查会在“前端 iframe 加载瞬间
+            // 同步读 window.Mvu/getAllVariables”时漏掉，导致前端报 undefined/读不到数据。
+            // 监听 iframe 新增：一出现新 iframe 就立即把 shim/getAllVariables/事件兜底同步过去。
+            try {
+                const doc = hostDocument;
+                const MO = (typeof MutationObserver !== 'undefined' ? MutationObserver : (hostWindow && hostWindow.MutationObserver)) || null;
+                if (doc && MO && doc.body) {
+                    windowMvuIframeObserver = new MO((muts) => {
+                        let hasIframe = false;
+                        for (const m of muts || []) {
+                            const nodes = (m && m.addedNodes) || [];
+                            for (const n of nodes) {
+                                if (!n || !n.tagName) continue;
+                                if (n.tagName === 'IFRAME') { hasIframe = true; break; }
+                                try { if (n.querySelectorAll && n.querySelectorAll('iframe').length) { hasIframe = true; break; } } catch (e) {}
+                            }
+                            if (hasIframe) break;
+                        }
+                        if (hasIframe) {
+                            try { applyWindowMvuShim(); } catch (e) {}
+                            // 重生成时旧状态栏先随消息删除，数据写入事件可能早于
+                            // 新 iframe 的 eventOn 注册。新 iframe 出现后只补发最近一次载荷；
+                            // 先清除 pending 再广播，避免前端重渲染再新建 iframe 时形成循环。
+                            const pendingUpdate = pendingLateFrontendUpdate;
+                            if (pendingUpdate && pendingUpdate.expiresAt >= Date.now() && pendingUpdate.chatKey === autoInitChatId()) {
+                                pendingLateFrontendUpdate = null;
+                                const session = captureRuntimeSession();
+                                hostWindow.setTimeout(() => {
+                                    try {
+                                        if (!isRuntimeSessionCurrent(session)) return;
+                                        applyWindowMvuShim();
+                                        emitMvuEvent('mag_variable_update_ended', pendingUpdate.after, pendingUpdate.before);
+                                        dbg('[前端迟到挂载] 新 iframe 已就绪，补发最近一次 VARIABLE_UPDATE_ENDED。');
+                                    } catch (e) {}
+                                }, 120);
+                            } else if (pendingUpdate && pendingUpdate.expiresAt < Date.now()) {
+                                pendingLateFrontendUpdate = null;
+                            }
+                        }
+                    });
+                    windowMvuIframeObserver.observe(doc.body, { childList: true, subtree: true });
+                }
+            } catch (e) {}
+        }
+        dbg(' 扩展侧已安装完整 Mvu shim（接管式）');
+    }
+    // 按当前卡同步运行时：转换卡 → 接管 Mvu/定义 getAllVariables/注册表格广播；
+    // 其他卡 → 全部撤销，确保扩展不影响任何非转换卡。
+    async function syncRuntimeForCurrentCard() {
+        const session = captureRuntimeSession();
+        let ch = null;
+        try { ch = currentCharacter(); } catch (e) {}
+        if (!ch) return;
+        // 角色对象带完整世界书且无标记 = 完整卡且非转换产物，直接撤销，不用发请求；
+        // 缺完整数据（角色列表懒加载元数据）才强制取完整卡确认。
+        const hasFullData = !!(ch && (ch.character_book || (ch.data && ch.data.character_book)));
+        if (!isConvertedMvuCard(ch) && !hasFullData) {
+            try {
+                // 强制取完整卡：角色列表对象可能只有元数据（缺 extensions），
+                // 不能只凭当前对象判断是否本转换器产物。
+                const full = await fetchFullCharacter(ch, true);
+                if (!isRuntimeSessionCurrent(session)) return;
+                if (full && isConvertedMvuCard(full)) ch = full;
+                else if (full === null) {
+                    // 获取完整卡失败（宿主扩展可能劫持了 fetch 返回 diff 对象）：
+                    // 不能据此撤销运行时，保留现状等 autoInitDatabase 重试。
+                    dbg(' 同步运行时：获取完整卡失败，暂不撤销（等自动建表重试）');
+                    return;
+                }
+            } catch (e) {}
+        }
+        if (isConvertedMvuCard(ch)) {
+            // 转换卡：直接从角色标记取 layout 并提前发布 Mvu。这一步不等
+            // SP·数据库 API、世界书解码或卡内外部 import，与 MVU initGlobals()“先发布
+            // 全局对象，后初始化聊天级模块”的可观测语义一致。
+            try {
+                const ext = charExtensions(ch) || {};
+                const marker = ext.mvu2ledger || {};
+                if (typeof marker.layout === 'string' || Array.isArray(marker.layout)) { activeLayout = resolveRuntimeLayout(marker.layout); activeCardApiMetadata = marker; }
+                if (activeLayout) activeLayoutCardKey = cardCacheKey(currentCharacter() || ch);
+            } catch (e) {
+                dbgWarn(' 同步运行时：提前解析 layout 失败，等自动建表流程重试:', e && e.message ? e.message : e);
+            }
+            installWindowGetAllVariables();
+            installWindowMvuShim();
+            installTableUpdateHook();
+        } else {
+            activeLayout = null;
+            activeLayoutCardKey = '';
+            activePlaceholderNeeded = false;
+            restoreWindowMvuShim();
+            restoreWindowGetAllVariables();
+            uninstallTableUpdateHook();
+        }
+    }
+
+    const readTargetSpVersion = window.__MVU2LEDGER_SP_VERSION_FACTORY__({
+        readExtensions: () => import('/scripts/extensions.js'),
+        readWindows: getRuntimeWindows,
+        readApi: getAcuApi,
+    });
+    async function doConvert(inputBytes, sourceIsPng, sourceCharacter) {
+        const operation = beginConversionOperation('convert');
+        if (!operation) return null;
+        try {
+            await operation.paint();
+            return await performConversion(inputBytes, sourceIsPng, sourceCharacter);
+        } finally { operation.close(); }
+    }
+
+    async function performConversion(inputBytes, sourceIsPng, sourceCharacter) {
+        const settings = getSettings();
+        const core = window.MVU2LEDGER_CORE;
+        if (!core || typeof core.convert !== 'function') {
+            throw new Error('转换核心未加载（MVU2LEDGER_CORE 不可用）');
+        }
+        const mode = 'sqlite';
+        const opts = {
+            mode,
+            targetSpVersion: await readTargetSpVersion(),
+            jsonContainers: settings.jsonContainers === true,
+            vwdDescriptions: !!(window.EjsTemplate && window.EjsTemplate.evalTemplate
+                && window.EjsTemplate.evalTemplate.__mvu2ledgerContextBridge),
+            asPng: settings.asPng === 'auto' ? sourceIsPng : settings.asPng === 'png',
+            appendPlaceholder: settings.appendPlaceholder !== false,
+            ddlIncludeCheck: settings.ddlIncludeCheck !== false,
+            translateSimpleEjs: !!settings.translateSimpleEjs,
+        };
+        if (settings.installMvuShim !== 'auto') {
+            opts.installMvuShim = settings.installMvuShim === 'yes';
+        }
+        let result = await core.convertWithRemoteSchemas(inputBytes, opts);
+        mergeState.appliedRefs = [];
+        activeProfileAppliedToLastResult = false;
+        if (activeProfileName) {
+            const applied = await applySelectedProfile(result.template);
+            if (applied.applied) {
+                opts.template = applied.template;
+                result = core.refreshConversion(result, opts);
+                activeProfileAppliedToLastResult = true;
+            }
+            result.reportText += '\n\n## 配置应用摘要\n\n' + applied.summary;
+            if (applied.notes.length) result.reportText += '\n\n- ' + applied.notes.join('\n- ');
+        }
+        lastInput = inputBytes;
+        if (result.meta.isPngInput) {
+            result.meta.avatarBytes = core.extractPngAvatar(inputBytes);
+            result.meta.avatarMime = 'image/png';
+        }
+        result.meta.sourceCharacter = sourceCharacter ? { name: characterDisplayName(sourceCharacter), avatar: sourceCharacter.avatar || '' } : null;
+        lastResult = result;
+        renderResult(result);
+        return result;
+    }
+
+    // 合并数据库插件现有模板：选择来源 → 列出表 → 勾选 → 并入转换结果
+    let mergeSourceTimer = null;
+    async function populateMergeSource(panel) {
+        const sel = panel.querySelector('#mvu2ledger-merge-source');
+        if (!sel) return;
+        const prev = sel.value;
+        sel.innerHTML = '';
+        const opt = (v, label) => {
+            const o = hostDocument.createElement('option');
+            o.value = v;
+            o.textContent = label;
+            sel.appendChild(o);
+        };
+        opt('', '（选择模板来源）');
+        opt('chat', '当前聊天模板');
+        opt('global', '全局模板（当前选中）');
+        const api = getAcuApi();
+        let presetCount = 0;
+        let presetOk = false;
+        if (api && typeof api.getTemplatePresetNames === 'function') {
+            try {
+                const names = api.getTemplatePresetNames() || [];
+                for (const n of names) opt('preset:' + n, '预设：' + n);
+                presetCount = names.length;
+                presetOk = true;
+            } catch (e) {
+                dbgWarn(' getTemplatePresetNames 异常:', e);
+            }
+        }
+        dbg(
+            'populateMergeSource: api=' + !!api +
+            ' | 有 getTemplatePresetNames=' + !!(api && typeof api.getTemplatePresetNames === 'function') +
+            ' | 预设数=' + presetCount + ' | 可读=' + presetOk
+        );
+        // 插件未就绪或预设尚未读到：持续重试（每 2.5 秒），直到成功读到一次预设列表
+        if (!presetOk) {
+            if (!mergeSourceTimer) {
+                mergeSourceTimer = hostWindow.setTimeout(() => {
+                    mergeSourceTimer = null;
+                    const p = hostDocument.getElementById(PANEL_ID);
+                    if (p) populateMergeSource(p);
+                }, 2500);
+            }
+        } else if (mergeSourceTimer) {
+            hostWindow.clearTimeout(mergeSourceTimer);
+            mergeSourceTimer = null;
+        }
+        if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+    }
+
+    function createColumnsToggle(sheet) {
+        const details = hostDocument.createElement('details');
+        details.className = 'mvu2ledger-cols-toggle';
+        details.style.margin = '2px 0 4px 0';
+        const summary = hostDocument.createElement('summary');
+        summary.textContent = '列名';
+        summary.style.cursor = 'pointer';
+        summary.style.fontSize = '12px';
+        summary.style.opacity = '0.8';
+        const body = hostDocument.createElement('div');
+        body.style.padding = '4px 6px';
+        body.style.fontSize = '12px';
+        body.style.wordBreak = 'break-all';
+        const hdr = Array.isArray(sheet && sheet.content && sheet.content[0]) ? sheet.content[0] : [];
+        const cols = hdr.filter(h => h !== 'row_id');
+        if (!cols.length) {
+            body.textContent = '（无列）';
+        } else {
+            body.appendChild(hostDocument.createTextNode('列名：'));
+            cols.forEach((c, i) => {
+                if (i) body.appendChild(hostDocument.createTextNode('、'));
+                const span = hostDocument.createElement('span');
+                span.textContent = c;
+                if (c === '_扩展数据') {
+                    span.style.opacity = '0.55';
+                    span.title = '内部列';
+                }
+                body.appendChild(span);
+            });
+        }
+        details.appendChild(summary);
+        details.appendChild(body);
+        return details;
+    }
+
+    async function loadMergeTables(panel) {
+        const sel = panel.querySelector('#mvu2ledger-merge-source');
+        const box = panel.querySelector('#mvu2ledger-merge-tables');
+        const status = panel.querySelector('#mvu2ledger-merge-status');
+        if (!sel || !box) return;
+        // 每次点击都重新拉取来源列表（预设可能刚导入）
+        await populateMergeSource(panel);
+        // 重渲染后下拉可能暂时为空：回退到上次加载成功的来源（合并后的自动刷新不会误报）
+        const v = sel.value || mergeState.source || '';
+        if (!v) { toast('请先选择模板来源', 'error'); return; }
+        mergeState.source = v;
+        const api = getAcuApi();
+        dbg(' loadMergeTables: 来源=' + v + ' | api=' + !!api + ' | 有 getTableTemplate=' + !!(api && typeof api.getTableTemplate === 'function'));
+        if (!api || typeof api.getTableTemplate !== 'function') {
+            toast('未找到 瑟瑟台账 插件 API', 'error');
+            return;
+        }
+        const tpl = await readTemplateSource(v);
+        dbg(' loadMergeTables: source=' + v + ' | 读到的模板=' + !!tpl + ' | sheet 数=' + (tpl ? Object.keys(tpl).filter(k => k.indexOf('sheet_') === 0).length : 0));
+        if (!tpl || typeof tpl !== 'object') {
+            toast(v === 'default' ? '瑟瑟台账默认模板不可用（不会回退为全局模板）' : '未读取到模板（该来源为空或插件未就绪）', 'error');
+            return;
+        }
+        mergeState.sourceTemplate = tpl;
+        const sheets = Object.keys(tpl).filter(k => k.startsWith('sheet_') && tpl[k] && typeof tpl[k] === 'object' && !Array.isArray(tpl[k]));
+        dbg(' loadMergeTables: 有效表=' + sheets.length + ' | 表名=' + sheets.map(k => tpl[k].name).join('、'));
+        if (!sheets.length) {
+            box.innerHTML = '';
+            toast('该模板没有表格', 'error');
+            return;
+        }
+        const existing = new Set();
+        if (lastResult && lastResult.template) {
+            for (const k of Object.keys(lastResult.template).filter(k => k.startsWith('sheet_'))) {
+                const s = lastResult.template[k];
+                if (s && typeof s.name === 'string') existing.add(String(s.name).trim());
+            }
+        }
+        box.innerHTML = '';
+        for (const uid of sheets) {
+            const s = tpl[uid];
+            const dup = existing.has(String(s.name || '').trim());
+            const label = hostDocument.createElement('label');
+            label.style.display = 'block';
+            const cb = hostDocument.createElement('input');
+            cb.type = 'checkbox';
+            cb.value = uid;
+            cb.checked = false;
+            label.appendChild(cb);
+            label.appendChild(hostDocument.createTextNode(
+                ' ' + (s.name || uid) +
+                (dup ? '（已存在于转换结果，合并将跳过）' : '')
+            ));
+            if (dup) cb.disabled = true;
+            const row = hostDocument.createElement('div');
+            row.style.margin = '2px 0';
+            row.appendChild(label);
+            row.appendChild(createColumnsToggle(s));
+            box.appendChild(row);
+        }
+        const applyBtn = panel.querySelector('#mvu2ledger-merge-apply');
+        if (applyBtn) applyBtn.style.display = lastResult ? '' : 'none';
+        if (status) status.textContent = '';
+        toast('已列出 ' + sheets.length + ' 张表，勾选后点击「合并到转换结果」', 'info');
+    }
+
+    async function applyMergeTables(panel) {
+        if (!lastResult || !lastInput) { toast('请先转换角色卡', 'error'); return; }
+        if (!mergeState.sourceTemplate) { toast('请先选择模板来源并点「加载表列表」，再勾选要并入的表', 'error'); return; }
+        const box = panel.querySelector('#mvu2ledger-merge-tables');
+        const status = panel.querySelector('#mvu2ledger-merge-status');
+        const checked = box ? [...box.querySelectorAll('input[type=checkbox]:checked')].map(cb => cb.value) : [];
+        if (!checked.length) { toast('请至少勾选一张要并入的表', 'error'); return; }
+        const core = window.MVU2LEDGER_CORE;
+        if (!core || typeof core.mergeTemplates !== 'function' || typeof core.refreshConversion !== 'function') {
+            toast('转换核心不可用', 'error');
+            return;
+        }
+        const manualPlan = conversionProfileTools.planManualMerge({
+            template: lastResult.template, sourceTemplate: mergeState.sourceTemplate, selected: checked,
+            source: mergeState.source, priorRefs: mergeState.appliedRefs,
+        });
+        const merged = manualPlan.merged;
+        dbg(' applyMergeTables: 勾选=' + checked.join('、') + ' | 新增=' + merged.added.join('、') + ' | 跳过=' + merged.skipped.join('、') + ' | 合并后表数=' + Object.keys(merged.template).filter(k => k.startsWith('sheet_')).length);
+        if (!merged.added.length) { toast('没有可并入的表（全部重名或无效）', 'error'); return; }
+        const settings = getSettings();
+        const mode = 'sqlite';
+        const opts = {
+            mode,
+            template: merged.template,
+            asPng: settings.asPng === 'auto' ? !!lastResult.meta.isPngInput : settings.asPng === 'png',
+            appendPlaceholder: settings.appendPlaceholder !== false,
+            ddlIncludeCheck: settings.ddlIncludeCheck !== false,
+            translateSimpleEjs: !!settings.translateSimpleEjs,
+        };
+        if (settings.installMvuShim !== 'auto') opts.installMvuShim = settings.installMvuShim === 'yes';
+        toast('正在合并表格…');
+        try {
+            const result = core.refreshConversion(lastResult, opts);
+            result.meta.sourceCharacter = lastResult.meta.sourceCharacter || null;
+            if (result.meta.isPngInput) {
+                result.meta.avatarBytes = lastResult.meta.avatarBytes || core.extractPngAvatar(lastInput);
+                result.meta.avatarMime = 'image/png';
+            }
+            lastResult = result;
+            mergeState.appliedRefs = manualPlan.refs;
+            renderResult(result);
+            dbg(' applyMergeTables 产物更新完成: meta.tableCount=' + result.meta.tableCount + ' | tableNames=' + result.meta.tableNames.join('、'));
+            const msg = '合并完成：新增 ' + merged.added.length + ' 张表' + (merged.skipped.length ? '，跳过重名：' + merged.skipped.join('、') : '');
+            if (status) status.textContent = msg;
+            toast(msg, 'info');
+            // 刷新勾选列表：已并入的表标记为“已存在”
+            try { await loadMergeTables(panel); } catch (e) {}
+        } catch (e) {
+            toast('合并失败：' + (e && e.message ? e.message : e), 'error');
+        }
+    }
+
+    async function fetchAvatarBlob(character) {
+        const context = getContextSafe();
+        const ch = character || currentCharacter();
+        if (!ch || !ch.avatar) return null;
+        try {
+            const headers = typeof context.getRequestHeaders === 'function' ? context.getRequestHeaders() : {};
+            const res = await fetch('/characters/' + encodeURIComponent(ch.avatar), { headers });
+            if (!res.ok) return null;
+            return await res.blob();
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // 比较 JSON 数据，不受对象键顺序影响；数组顺序和脚本内容必须完全一致。
+    function sameSavedScriptData(a, b) {
+        if (a === b) return true;
+        if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+        if (Array.isArray(a) !== Array.isArray(b)) return false;
+        const keys = Object.keys(a);
+        return keys.length === Object.keys(b).length && keys.every(key =>
+            Object.prototype.hasOwnProperty.call(b, key) && sameSavedScriptData(a[key], b[key]));
+    }
+
+    let conversionOperation = null;
+
+    function beginConversionOperation(kind) {
+        if (conversionOperation) return null;
+        const title = kind === 'save' ? '正在保存角色卡…' : '正在转换角色卡…';
+        const panel = hostDocument.getElementById(PANEL_ID);
+        const controls = panel ? [...panel.querySelectorAll('button, input, select, textarea')].map(node => [node, node.disabled]) : [];
+        const overlay = hostDocument.createElement('div');
+        overlay.className = 'mvu2ledger-operation-overlay';
+        overlay.setAttribute('role', 'dialog');
+        overlay.setAttribute('aria-modal', 'true');
+        overlay.setAttribute('aria-label', title);
+        overlay.tabIndex = -1;
+        overlay.innerHTML = '<div class="mvu2ledger-operation-box"><i class="fa-solid fa-spinner fa-spin" aria-hidden="true"></i><strong></strong><p aria-live="polite"></p></div>';
+        overlay.querySelector('strong').textContent = title;
+        const detail = overlay.querySelector('p');
+        const started = Date.now(), timings = [];
+        const operation = {
+            update(text) { detail.textContent = text; timings.push({ stage: text, ms: Date.now() - started }); },
+            paint() { return new Promise(resolve => hostWindow.setTimeout(resolve, 30)); },
+            close() {
+                if (conversionOperation !== operation) return;
+                overlay.remove();
+                for (const [node, disabled] of controls) node.disabled = disabled;
+                conversionOperation = null;
+                dbg('[界面操作耗时] ' + kind + ' ' + (Date.now() - started) + 'ms ' + JSON.stringify(timings));
+            },
+        };
+        conversionOperation = operation;
+        for (const [node] of controls) node.disabled = true;
+        operation.update(kind === 'save' ? '准备保存，请稍候…' : '分析角色卡并生成表格，请稍候…');
+        hostDocument.body.appendChild(overlay);
+        overlay.focus();
+        return operation;
+    }
+
+    let worldbookSaver = null;
+    function getWorldbookSaver() {
+        if (!worldbookSaver) {
+            const coreApi = window.MVU2LEDGER_CORE;
+            const storage = coreApi.getWorldbookStorageFactory()({
+                document: hostDocument, fetch: (...args) => fetch(...args), download,
+                loadModule: () => import('/scripts/world-info.js'),
+                getContext: getContextSafe,
+                async getHeaders() {
+                    const context = getContextSafe();
+                    if (typeof context.getRequestHeaders === 'function') return context.getRequestHeaders();
+                    return (await import('/script.js')).getRequestHeaders();
+                },
+            });
+            worldbookSaver = coreApi.getWorldbookSaveFactory()(storage);
+        }
+        return worldbookSaver;
+    }
+
+    async function saveCardToSillyTavern() {
+        if (conversionOperation) return false;
+        if (!lastResult) { toast('请先转换', 'error'); return false; }
+        const result = lastResult;
+        const operation = beginConversionOperation('save');
+        try {
+            await operation.paint();
+            return await saveConvertedCard(operation, result);
+        } finally { operation.close(); }
+    }
+
+    async function saveConvertedCard(operation, result) {
+        if (!result) {
+            toast('请先转换', 'error');
+            return false;
+        }
+        // 参数有实时改动时，先按当前模板重新生成角色卡（内嵌 base64 模板），再保存
+        if (updateParamsDirty) {
+            try {
+                if (lastResult !== result) throw new Error('转换结果已更换，请重新保存');
+                operation.update('更新角色卡与表格模板…');
+                refreshConvertedResult();
+                result = lastResult;
+            } catch (e) {
+                toast('保存前刷新参数失败：' + (e && e.message ? e.message : e), 'error');
+                return false;
+            }
+        }
+        const panel = hostDocument.getElementById(PANEL_ID);
+        const context = getContextSafe();
+        const log = [];
+        let worldbookPlan;
+        const displayName = String((result.card && (result.card.data || result.card).name) || '').trim() || '角色';
+        try {
+            operation.update('准备角色卡与头像…');
+            // 统一成 chara_card_v3 包装（服务端按 json_data 整体导入，保留世界书等全部内容）
+            let cardData = result.card;
+            if (cardData && !cardData.data && cardData.name) {
+                cardData = { spec: 'chara_card_v3', spec_version: '3.0', data: cardData };
+            }
+            operation.update('检查本地世界书…');
+            const saver = getWorldbookSaver();
+            worldbookPlan = await saver.prepare(cardData);
+            if (worldbookPlan.cancelled) { toast('已取消保存', 'info'); return false; }
+            cardData = worldbookPlan.card;
+            let avatarBlob = null;
+            if (result.meta && result.meta.avatarBytes) {
+                avatarBlob = new Blob([result.meta.avatarBytes], { type: result.meta.avatarMime || 'application/json' });
+            } else {
+                avatarBlob = result.meta && result.meta.sourceCharacter
+                    ? await fetchAvatarBlob(result.meta.sourceCharacter) : null;
+                if (avatarBlob && avatarBlob.type === 'image/png') {
+                    const coreApi = window.MVU2LEDGER_CORE;
+                    avatarBlob = new Blob([coreApi.extractPngAvatar(await avatarBlob.arrayBuffer())], { type: 'image/png' });
+                }
+            }
+
+            operation.update('同步本地世界书…');
+            await saver.commit(worldbookPlan);
+            if (worldbookPlan.action !== 'skip') {
+                log.push('✓ 世界书已' + (worldbookPlan.action === 'reuse' ? '复用' : worldbookPlan.action === 'update' ? '更新' : '创建') + '：' + worldbookPlan.name);
+                if (worldbookPlan.backup) log.push('✓ 已发起旧世界书 JSON 备份下载（请确认浏览器下载结果）');
+            }
+
+            // 优先用新版 API；老版本 createCharacterData 是表单状态对象时走直接接口
+            let saved = false;
+            let savedAvatar = '';
+            operation.update('写入角色卡…');
+            if (typeof context.createCharacterData === 'function') {
+                const created = await context.createCharacterData(undefined, avatarBlob || new Blob(), cardData, false);
+                savedAvatar = typeof created === 'string'
+                    ? created.trim()
+                    : String(created && (created.avatar || created.avatarId || created.fileName) || '').trim();
+                saved = true;
+            } else {
+                // 直接走 /api/characters/create：必须把角色卡所有字段都放进表单，
+                // 服务端 charaFormatData 会用表单字段覆盖卡内同名字段，缺字段会被清空。
+                const d = cardData.data || cardData;
+                const ex = d.extensions || {};
+                const dp = ex.depth_prompt || {};
+                const appendStr = (key, value) => {
+                    if (value !== undefined && value !== null) formData.append(key, String(value));
+                };
+                const formData = new FormData();
+                formData.append('ch_name', displayName);
+                formData.append('json_data', JSON.stringify(cardData));
+                appendStr('description', d.description);
+                appendStr('personality', d.personality);
+                appendStr('scenario', d.scenario);
+                appendStr('first_mes', d.first_mes);
+                appendStr('mes_example', d.mes_example);
+                appendStr('creator_notes', d.creator_notes);
+                appendStr('system_prompt', d.system_prompt);
+                appendStr('post_history_instructions', d.post_history_instructions);
+                appendStr('creator', d.creator);
+                appendStr('character_version', d.character_version);
+                appendStr('talkativeness', d.talkativeness !== undefined ? d.talkativeness : ex.talkativeness);
+                appendStr('fav', ex.fav === true);
+                appendStr('world', ex.world);
+                appendStr('depth_prompt_prompt', dp.prompt);
+                appendStr('depth_prompt_depth', dp.depth);
+                appendStr('depth_prompt_role', dp.role);
+                const tags = Array.isArray(d.tags) ? d.tags.join(',') : d.tags;
+                appendStr('tags', tags);
+                const greetings = Array.isArray(d.alternate_greetings) ? d.alternate_greetings : (d.alternate_greetings ? [d.alternate_greetings] : []);
+                for (const g of greetings) formData.append('alternate_greetings', g);
+                formData.append('extensions', JSON.stringify(ex));
+                if (avatarBlob) formData.append('avatar', avatarBlob, 'avatar.png');
+                const headers = typeof context.getRequestHeaders === 'function'
+                    ? context.getRequestHeaders({ omitContentType: true })
+                    : {};
+                const res = await fetch('/api/characters/create', {
+                    method: 'POST',
+                    headers,
+                    body: formData,
+                });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                // ST create 接口返回刚创建卡的唯一头像文件名。同名卡
+                // 可能并存，不能只按显示名反查。
+                savedAvatar = String(await res.text() || '').trim();
+                saved = true;
+            }
+            if (!saved) throw new Error('角色卡保存失败（未知原因）');
+            log.push('✓ 角色卡已保存：' + displayName);
+            try {
+                const expectedData = cardData && (cardData.data || cardData);
+                const expectedExt = expectedData && expectedData.extensions;
+                const expectedMarker = expectedExt && expectedExt.mvu2ledger;
+                if (expectedExt && expectedExt.tavern_helper) {
+                    let refreshedCharacters;
+                    let syncReason = '';
+                    try {
+                        operation.update('刷新角色列表…');
+                        if (typeof context.getCharacters === 'function') refreshedCharacters = await context.getCharacters();
+                        else syncReason = '宿主未提供角色列表刷新接口';
+                    } catch (e) {
+                        syncReason = '刷新角色列表失败：' + (e && e.message ? e.message : e);
+                    }
+                    const refreshedContext = getContextSafe();
+                    const charsNow = Array.isArray(refreshedCharacters)
+                        ? refreshedCharacters
+                        : (Array.isArray(refreshedContext.characters) ? refreshedContext.characters : (Array.isArray(context.characters) ? context.characters : []));
+                    const coreApi = window.MVU2LEDGER_CORE;
+                    const lookupDiagnostic = {};
+                    const savedIndex = coreApi && typeof coreApi.findConvertedCharacterIndex === 'function'
+                        ? await coreApi.findConvertedCharacterIndex(charsNow, {
+                            displayName,
+                            avatar: savedAvatar,
+                            convertedAt: expectedMarker && expectedMarker.convertedAt,
+                        }, ch => fetchFullCharacter(ch, true, lookupDiagnostic))
+                        : -1;
+                    const writeExtensionField = (refreshedContext && refreshedContext.writeExtensionField) || context.writeExtensionField;
+                    let synced = false;
+                    if (savedIndex >= 0 && typeof writeExtensionField === 'function') {
+                        // 保留刷新后重申字段，防止助手的旧面板状态延后回写。
+                        // 字段接口可能吞掉 HTTP 错误，调用完成不能代替读回复核。
+                        const tavernHelperCopy = JSON.parse(JSON.stringify(expectedExt.tavern_helper));
+                        try {
+                            operation.update('同步酒馆助手脚本…');
+                            await writeExtensionField(savedIndex, 'tavern_helper', tavernHelperCopy);
+                            synced = true;
+                        } catch (e) {
+                            syncReason = '脚本字段同步失败：' + (e && e.message ? e.message : e);
+                        }
+                    } else if (!syncReason) {
+                        syncReason = savedIndex < 0
+                            ? (lookupDiagnostic.reason || '刷新后的角色列表未能精确定位新卡')
+                            : '宿主未提供脚本字段写入接口';
+                    }
+                    // 创建接口返回的头像是新卡唯一身份；即使列表未同步或无写入接口，
+                    // 也可以只读复核该卡。绝不靠同名卡进行补写。
+                    const avatar = savedAvatar || (savedIndex >= 0 && charsNow[savedIndex] && charsNow[savedIndex].avatar);
+                    const diagnostic = {};
+                    operation.update('读回并核对已保存的脚本…');
+                    const persisted = avatar ? await fetchFullCharacter({ avatar }, true, diagnostic) : null;
+                    const actualData = persisted && (persisted.data || persisted);
+                    const actualExt = actualData && actualData.extensions;
+                    const actualMarker = actualExt && actualExt.mvu2ledger;
+                    let failure = '';
+                    if (!avatar) failure = '创建接口未返回头像，且角色列表未能精确定位新卡';
+                    else if (!persisted) failure = diagnostic.reason || '未能读取已保存角色卡的完整数据';
+                    else if (!expectedMarker || !expectedMarker.convertedAt || !actualMarker ||
+                        actualMarker.converter !== 'mvu2ledger' || actualMarker.convertedAt !== expectedMarker.convertedAt) {
+                        failure = '读回角色卡的转换标记与本次转换不一致';
+                    } else if (!sameSavedScriptData(actualExt.tavern_helper, expectedExt.tavern_helper)) {
+                        failure = '读回的酒馆助手脚本数据与转换结果不一致';
+                    }
+                    if (!failure) {
+                        log.push(synced ? '✓ 已同步并读回确认酒馆助手脚本与转换结果一致' : '✓ 已读回确认酒馆助手脚本与转换结果一致');
+                    } else {
+                        const detail = syncReason && syncReason !== failure ? failure + '；' + syncReason : failure;
+                        log.push('⚠ 角色卡已保存，但脚本复核未通过：' + detail + '。请保留此提示；若脚本面板仍异常，可用下载 PNG 导入。');
+                    }
+                }
+                if (panel) populateCharacterSelect(panel);
+            } catch (e) {
+                log.push('⚠ 角色卡已保存，但复核酒馆助手脚本异常：' + (e && e.message ? e.message : e));
+            }
+        } catch (e) {
+            const msg = (e && e.message ? e.message : e);
+            const bookNotice = worldbookPlan && worldbookPlan.writeAttempted
+                ? '\n\n世界书已尝试写入' + (worldbookPlan.written ? '并收到成功响应' : '，结果尚未确认') + '：' + worldbookPlan.name + '。世界书与角色卡无法作为同一事务保存；请检查本地世界书，必要时用备份恢复。'
+                : '';
+            toast('保存失败，已回退到下载：' + msg, 'error');
+            for (const f of result.files) {
+                if (f.kind === 'card') download(f.name, f.mime, f.data);
+            }
+            if (lastResult === result) await autoSaveConversionProfile();
+            operation.close();
+            showInfoPopup('保存失败', '角色卡保存失败，已回退到下载。\n\n' + msg + bookNotice + '\n\n如需排查请把此日志发给开发者。');
+            return false;
+        }
+
+        // 第二步：把表格模板存为插件的“全局模板预设”（失败不阻断角色卡保存）
+        let presetName = '';
+        const acu = getAcuApi();
+        if (acu && result.template) {
+            presetName = 'MVU台账-' + displayName + '模板';
+            try {
+                operation.update('保存数据库模板预设…');
+                const presetResult = await acu.importTemplateFromData(result.template, { scope: 'global', presetName });
+                if (presetResult && presetResult.success === false) {
+                    log.push('✗ 表格模板导入插件失败：' + (presetResult.message || '未知原因'));
+                } else {
+                    log.push('✓ 表格模板已保存为插件预设：' + presetName);
+                }
+            } catch (e) {
+                log.push('✗ 表格模板导入插件异常：' + (e && e.message ? e.message : e));
+            }
+        } else {
+            log.push('⚠ 未找到 瑟瑟台账 插件 API，模板未导入（可下载“表格模板 JSON”手动导入插件）。');
+        }
+
+        // 第三步：弹窗汇总
+        const hasError = log.some(line => line.startsWith('✗'));
+        const body = log.join('\n') + (hasError
+            ? '\n\n有失败项，请把上方日志发给开发者排查。'
+            : (presetName
+                ? '\n\n进入新聊天且表格为空时会自动建表，无需手动切换；模板已存为插件预设「' + presetName + '」备用，也可在插件模板面板手动切换。'
+                : ''));
+        operation.update('保存转换配置…');
+        if (lastResult === result) await autoSaveConversionProfile();
+        operation.close();
+        showInfoPopup(hasError ? '保存完成（有失败项）' : '保存完成', body);
+        return !hasError;
+    }
+
+    // 弹窗：优先用酒馆通用弹窗，失败退回 toast
+    function showInfoPopup(title, body) {
+        const context = getContextSafe();
+        const esc = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        try {
+            if (context.callGenericPopup && context.POPUP_TYPE) {
+                const html = '<h3>' + esc(title) + '</h3><pre style="white-space:pre-wrap;text-align:left;max-height:50vh;overflow:auto;">' + esc(body) + '</pre>';
+                context.callGenericPopup(html, context.POPUP_TYPE.TEXT, '', { okButton: '知道了' });
+                return;
+            }
+        } catch (e) {}
+        try {
+            if (hostWindow.alert) hostWindow.alert(title + '\n\n' + body);
+        } catch (e2) {}
+        toast(title + '：' + body, 'info');
+    }
+
+    // 结果视图只改本次模板；下载/保存时刷新卡内模板与登记桥。
+    const updateParamState = {};
+    let updateParamsDirty = false;
+    const resultView = window.__MVU2LEDGER_RESULT_VIEW_FACTORY__({
+        document: hostDocument, paramState: updateParamState, createColumnsToggle,
+        onChange: () => { updateParamsDirty = true; }, notify: toast,
+    });
+    const conversionProfileTools = window.__MVU2LEDGER_CONVERSION_PROFILES_FACTORY__({
+        core: window.MVU2LEDGER_CORE, resultView, readTemplateSource, listSheets: updateParamSheetRows,
+    });
+
+    function refreshConvertedResult() {
+        // 模板参数编辑仅刷新产物；转换规则变化时核心自动退回完整转换。
+        if (!lastInput || !lastResult) return null;
+        const settings = getSettings();
+        const core = window.MVU2LEDGER_CORE;
+        if (!core || typeof core.refreshConversion !== 'function') throw new Error('转换核心不可用');
+        const opts = {
+            mode: 'native',
+            template: lastResult.template,
+            asPng: settings.asPng === 'auto' ? !!lastResult.meta.isPngInput : settings.asPng === 'png',
+            appendPlaceholder: settings.appendPlaceholder !== false,
+            ddlIncludeCheck: settings.ddlIncludeCheck !== false,
+            translateSimpleEjs: !!settings.translateSimpleEjs,
+        };
+        if (settings.installMvuShim !== 'auto') opts.installMvuShim = settings.installMvuShim === 'yes';
+        const result = core.refreshConversion(lastResult, opts);
+        result.meta.sourceCharacter = lastResult.meta.sourceCharacter || null;
+        if (result.meta.isPngInput) {
+            result.meta.avatarBytes = lastResult.meta.avatarBytes || core.extractPngAvatar(lastInput);
+            result.meta.avatarMime = 'image/png';
+        }
+        lastResult = result;
+        updateParamsDirty = false;
+        return result;
+    }
+
+    function updateParamSheetRows(result) {
+        return Object.keys(result.template || {})
+            .filter(k => k.startsWith('sheet_'))
+            .map(k => ({ uid: k, sheet: result.template[k] }))
+            .filter(x => x.sheet && typeof x.sheet === 'object' && !Array.isArray(x.sheet))
+            .sort((a, b) => {
+                const ao = Number.isFinite(a.sheet.orderNo) ? a.sheet.orderNo : 999999;
+                const bo = Number.isFinite(b.sheet.orderNo) ? b.sheet.orderNo : 999999;
+                return ao - bo || String(a.sheet.name || a.uid).localeCompare(String(b.sheet.name || b.uid), 'zh-CN');
+            });
+    }
+
+    function renderUpdateConfigEditor(box, result) {
+        resultView.renderEditor(box, updateParamSheetRows(result));
+    }
+
+    // 合并数据库插件现有模板区块：放在参数编辑器与转换报告之间，转换后边改边并更方便
+    function renderMergeSection(box, panel) {
+        const sec = hostDocument.createElement('details');
+        sec.className = 'mvu2ledger-merge-section mvu2ledger-detail';
+        sec.innerHTML =
+            '<summary>合并其他数据库表格（可选）</summary>' +
+            '<div class="mvu2ledger-row">' +
+            '  <label class="mvu2ledger-label" for="mvu2ledger-merge-source">合并数据库现有表格模板（转换完成后可用）</label>' +
+            '  <select id="mvu2ledger-merge-source" title="选择模板来源：当前聊天模板 / 全局模板 / 全局预设"></select>' +
+            '  <button id="mvu2ledger-merge-load" class="menu_button">加载表列表</button>' +
+            '</div>' +
+            '<div id="mvu2ledger-merge-tables" class="mvu2ledger-hint">选择来源后点「加载表列表」，勾选要并入转换结果（角色卡模板）的表；重名表会自动跳过。</div>' +
+            '<div class="mvu2ledger-row">' +
+            '  <button id="mvu2ledger-merge-apply" class="menu_button" style="display:none">合并到转换结果</button>' +
+            '  <span id="mvu2ledger-merge-status" class="mvu2ledger-hint"></span>' +
+            '</div>';
+        box.appendChild(sec);
+        const loadBtn = sec.querySelector('#mvu2ledger-merge-load');
+        if (loadBtn && loadBtn.dataset.bound !== 'true') {
+            loadBtn.dataset.bound = 'true';
+            loadBtn.addEventListener('click', () => loadMergeTables(panel));
+        }
+        const applyBtn = sec.querySelector('#mvu2ledger-merge-apply');
+        if (applyBtn && applyBtn.dataset.bound !== 'true') {
+            applyBtn.dataset.bound = 'true';
+            applyBtn.addEventListener('click', () => applyMergeTables(panel));
+        }
+        // 恢复上次加载成功的来源（首次默认「全局模板」），减少一次手选；
+        // 加载成功后「合并到转换结果」按钮才会出现
+        const srcSel = sec.querySelector('#mvu2ledger-merge-source');
+        if (srcSel) srcSel.value = mergeState.source || 'global';
+        // 每次渲染都刷新来源下拉（预设可能刚导入）；内部有 2.5s 未就绪重试
+        populateMergeSource(panel);
+    }
+
+    function renderResult(result) {
+        const panel = hostDocument.getElementById(PANEL_ID);
+        if (!panel) return;
+        const box = panel.querySelector('.mvu2ledger-result');
+        if (!box) return;
+        box.innerHTML = '';
+        // 每次渲染出的转换结果都是最新状态（含刚合并/刚改完参数），重置“待刷新”标记
+        updateParamsDirty = false;
+        resultView.renderReport(box, result);
+        renderUpdateConfigEditor(box, result);
+        renderMergeSection(box, panel);
+        // 最后一步：下载与保存到酒馆（放在合并模板区块之后）
+        const downloadsBox = panel.querySelector('#mvu2ledger-downloads');
+        if (downloadsBox) {
+            downloadsBox.innerHTML = '';
+            for (const f of result.files) {
+                const btn = hostDocument.createElement('button');
+                btn.className = 'menu_button';
+                btn.textContent = f.kind === 'bridge' ? '下载数据桥源码（仅供调试）' : ('下载 ' + f.name);
+                if (f.kind === 'bridge') {
+                    btn.title = '该 .js 是已内嵌进转换后角色卡的纯源码备份，无需再导入；它不是酒馆助手要求的 .json 导入包。';
+                }
+                btn.addEventListener('click', async () => {
+                    // 下载时用最新模板重新生成，保证参数改动一定带进文件
+                    try {
+                        if (f.kind === 'template') {
+                            download(f.name, f.mime, JSON.stringify(lastResult.template, null, 2));
+                            await autoSaveConversionProfile();
+                        } else if (f.kind === 'card') {
+                            refreshConvertedResult();
+                            const fresh = (lastResult.files || []).find(x => x.kind === 'card');
+                            if (!fresh) throw new Error('重新生成的角色卡文件缺失');
+                            download(fresh.name, fresh.mime, fresh.data);
+                            await autoSaveConversionProfile();
+                        } else if (f.kind === 'bridge') {
+                            if (updateParamsDirty) refreshConvertedResult();
+                            const fresh = (lastResult.files || []).find(x => x.kind === 'bridge');
+                            if (!fresh) throw new Error('重新生成的数据桥文件缺失');
+                            download(fresh.name, fresh.mime, fresh.data);
+                        } else {
+                            download(f.name, f.mime, lastResult.reportText || f.data);
+                        }
+                    } catch (e) {
+                        toast('下载内容刷新失败，已使用转换时的版本：' + (e && e.message ? e.message : e), 'error');
+                        download(f.name, f.mime, f.data);
+                    }
+                });
+                downloadsBox.appendChild(btn);
+            }
+        }
+        const saveBtn = panel.querySelector('#mvu2ledger-save-card');
+        if (saveBtn) saveBtn.style.display = '';
+        toast('转换完成，共 ' + result.meta.tableCount + ' 张表');
+    }
+
+    function findSettingsMount() {
+        const selectors = [
+            '#extensions_settings2',
+            '#extensions_settings',
+            '#third_party_extension_settings',
+            '.extensions_settings',
+        ];
+        for (const selector of selectors) {
+            const node = hostDocument.querySelector(selector);
+            if (node) return node;
+        }
+        return null;
+    }
+
+    function renderSettingsPanel(panel) { panel.innerHTML = window.__MVU2LEDGER_SETTINGS_VIEW__(getSettings()); }
+
+    const stateTransfer = window.MVU2LEDGER_CORE.getStateTransferFactory()();
+    let stateTransferBusy = false;
+    function stateTransferProgress(text) {
+        const panel = hostDocument.getElementById(PANEL_ID);
+        for (const id of ['mvu2ledger-export-state', 'mvu2ledger-import-state']) {
+            const button = panel?.querySelector('#' + id); if (button) button.disabled = id === 'mvu2ledger-import-state' || stateTransferBusy;
+        }
+        const status = panel?.querySelector('#mvu2ledger-state-progress');
+        if (status) status.textContent = text;
+    }
+    function stateTransferHelper() {
+        for (const w of [window, hostWindow]) {
+            const helper = runtimeGlobals.original(w, 'TavernHelper');
+            if (helper && typeof helper.getVariables === 'function' && typeof helper.replaceVariables === 'function') return helper;
+        }
+        throw new Error('需要酒馆助手的公开消息变量接口');
+    }
+    function assertStateTransferIdle() {
+        if (pendingStatWrite || statWriteFlushPromise || autoInitState.running || getContextSafe().streamingProcessor && !getContextSafe().streamingProcessor.isFinished) {
+            throw new Error('聊天或变量仍在更新，请等待完成后重试');
+        }
+        const stop = hostDocument.querySelector('#mes_stop');
+        if (stop && stop.getClientRects().length && hostWindow.getComputedStyle(stop).visibility !== 'hidden') throw new Error('正文正在生成，请等待完成后重试');
+    }
+    function stateTransferTableNames(tables) {
+        return Object.keys(tables || {}).filter(key => key.startsWith('sheet_') && tables[key]?.name).map(key => String(tables[key].name)).sort();
+    }
+    async function waitStateTransferTableRead(api, session, expected) {
+        const deadline = Date.now() + 15000;
+        while (true) {
+            assertRuntimeSession(session);
+            const tables = api?.exportTableAsJson?.() || {};
+            if (!expected.length || stateTransfer.equal(stateTransferTableNames(tables), expected)) return tables;
+            if (Date.now() >= deadline) throw new Error('数据库尚未发布目标聊天的完整状态，请稍后重试');
+            await new Promise(resolve => hostWindow.setTimeout(resolve, 100));
+        }
+    }
+    async function captureStateTransferSnapshot() {
+        assertStateTransferIdle();
+        const context = getContextSafe(), ch = currentCharacter();
+        if (!context.chatId || !Array.isArray(context.chat) || !context.chat.length) throw new Error('请先打开有消息的目标聊天');
+        const chatLength = context.chat.length;
+        const session = bindWriteTarget(captureRuntimeSession(() => getContextSafe().chat?.length === chatLength));
+        if (!session.writeTarget) throw new Error('聊天中没有可写的 AI 消息');
+        const helper = stateTransferHelper(), index = session.writeTarget.index;
+        let variableOption = { type: 'message', message_id: index };
+        const converted = isConvertedMvuCard(ch), api = getAcuApi();
+        const hasDatabase = converted || context.chatMetadata?.TavernDB_ACU_ScopedConfig || context.chat.some(row => row?.TavernDB_ACU_IsolatedData);
+        const template = hasDatabase && api?.getTableTemplate ? await api.getTableTemplate({ scope: 'chat' }) : null;
+        const tables = stateTransfer.clone(await waitStateTransferTableRead(api, session, stateTransferTableNames(template)));
+        assertStateTransferIdle();
+        let raw = stateTransfer.clone(helper.getVariables(variableOption));
+        let mvu, layout = [];
+        if (converted) {
+            if (!activeLayout || activeLayoutCardKey !== cardCacheKey(ch)) throw new Error('转换卡布局尚未就绪，请稍后重试');
+            layout = stateTransfer.clone(activeLayout);
+            mvu = mvuDataFromCompleteTableSnapshot(tables, index, true);
+            if (!mvu) throw new Error('当前数据库不包含转换卡完整表格，请先初始化正确模板');
+            mvu = { ...raw, ...mvu, ...(raw.schema !== undefined ? { schema: raw.schema } : {}), initialized_lorebooks: raw.initialized_lorebooks || {} };
+        } else {
+            // 与消息变量读取的选中 swipe 一致；没有新状态的楼层沿用最近一份 MVU 状态。
+            for (let i = index; i >= 0; i--) {
+                const row = context.chat[i]; if (!row || row.is_user) continue;
+                const vars = helper.getVariables({ type: 'message', message_id: i });
+                if (vars && vars.stat_data && typeof vars.stat_data === 'object' && !Array.isArray(vars.stat_data) && vars.schema !== undefined) { mvu = { ...stateTransfer.clone(vars), stat_data: stateTransfer.stat(vars.stat_data) }; break; }
+            }
+            if (!mvu) {
+                const vars = helper.getVariables({ type: 'chat' });
+                if (vars && vars.stat_data && typeof vars.stat_data === 'object' && !Array.isArray(vars.stat_data) && vars.schema !== undefined) {
+                    variableOption = { type: 'chat' }; raw = stateTransfer.clone(vars);
+                    mvu = { ...stateTransfer.clone(vars), stat_data: stateTransfer.stat(vars.stat_data) };
+                }
+            }
+            if (!mvu) throw new Error('当前聊天没有已初始化的 MVU 消息／聊天状态（stat_data / schema）');
+        }
+        const latestContext = getContextSafe();
+        const metadata = latestContext.chatMetadata || latestContext.chat_metadata || {};
+        const originalName = charExtensions(ch)?.mvu2ledger?.originalName || characterDisplayName(ch) || context.name2 || '';
+        return { session, helper, index, variableOption, api, converted, layout, raw, mvu, tables, template: stateTransfer.clone(template || null),
+            chat: stateTransfer.clone(latestContext.chat), metadata: stateTransfer.clone(metadata),
+            source: { character: originalName, chat: String(context.chatId), message: index, swipe: Number(context.chat[index].swipe_id || 0),
+                backend: converted ? 'converted' : 'mvu', scope: variableOption.type, converterVersion: window.MVU2LEDGER_CORE.VERSION },
+        };
+    }
+    function assertStateTransferUnchanged(snapshot) {
+        assertRuntimeSession(snapshot.session); assertStateTransferIdle(); snapshot.schemaGuard?.();
+        const context = getContextSafe();
+        const changes = [];
+        if (!stateTransfer.equal(snapshot.chat, context.chat)) changes.push('消息');
+        if (!stateTransfer.equal(snapshot.metadata, context.chatMetadata || context.chat_metadata || {})) changes.push('聊天元数据');
+        if (!stateTransfer.equalRuntimeTables(snapshot.tables, snapshot.api?.exportTableAsJson() || {})) changes.push('表格');
+        if (snapshot.template && !stateTransfer.equal(snapshot.template, snapshot.api?.getTableTemplate?.({ scope: 'chat' }) || null)) changes.push('表格模板');
+        if (changes.length) {
+            const error = new Error('预览后' + changes.join('、') + '已更新，请重新导入');
+            error.stateTransferChanges = changes;
+            throw error;
+        }
+    }
+    function stateTransferFilename(name, suffix) {
+        return String(name || '聊天').replace(/[\x00-\x1f\x7f<>:"/\\|?*]/g, '_').replace(/[. ]+$/g, '').slice(0, 100) + '-' + new Date().toISOString().replace(/[:.]/g, '-') + suffix;
+    }
+    async function saveStateTransferChat(snapshot) {
+        assertRuntimeSession(snapshot.session);
+        const context = getContextSafe();
+        const save = context.saveChatConditional || context.saveChat;
+        if (typeof save !== 'function') throw new Error('酒馆聊天保存接口不可用');
+        await save.call(context); assertRuntimeSession(snapshot.session);
+        await waitStateTransferTableRead(snapshot.api, snapshot.session, stateTransferTableNames(snapshot.tables));
+    }
+    async function exportStateTransferChat(snapshot) {
+        assertRuntimeSession(snapshot.session);
+        const context = getContextSafe();
+        const filename = String(context.chatId).replace(/\.jsonl$/i, '');
+        const avatar = currentCharacter()?.avatar;
+        if (!context.groupId && !avatar) throw new Error('无法确定聊天备份的角色身份');
+        const response = await hostWindow.fetch('/api/chats/export', { method: 'POST', headers: context.getRequestHeaders(),
+            body: JSON.stringify({ is_group: !!context.groupId, avatar_url: avatar, file: filename + '.jsonl', exportfilename: filename + '.jsonl', format: 'jsonl' }) });
+        assertRuntimeSession(snapshot.session);
+        if (!response.ok) throw new Error('聊天备份导出失败：HTTP ' + response.status);
+        const result = await response.json();
+        if (typeof result.result !== 'string') throw new Error('酒馆未返回聊天备份');
+        return result.result;
+    }
+    async function prepareStateTransferImport(input) {
+        const session = captureRuntimeSession();
+        for (let attempt = 0; ; attempt++) {
+            try { return await prepareStateTransferImportOnce(input); }
+            catch (error) {
+                assertRuntimeSession(session);
+                // 尚未展示预览，允许用初始化后最新的元数据/表格重新准备。
+                // 消息变化、切换会话及确认后的变化仍拒绝，不能覆盖用户操作。
+                if (attempt >= 2 || !error.stateTransferChanges || error.stateTransferChanges.includes('消息')) throw error;
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+        }
+    }
+    async function prepareStateTransferImportOnce(input) {
+        const archive = stateTransfer.parse(input), snapshot = await captureStateTransferSnapshot();
+        const extras = stateTransfer.matchExtras(archive.extraTables, snapshot.tables, snapshot.layout);
+        if (snapshot.converted || extras.matches.length) {
+            stateTransfer.assertPersistentDbVersion(await readTargetSpVersion());
+            assertStateTransferUnchanged(snapshot);
+        }
+        const rules = snapshot.converted && (readCardApiMetadata().schemaKeys || []).length
+            ? await currentCardApi?.stateImportRules() : null;
+        if (snapshot.converted && (readCardApiMetadata().schemaKeys || []).length && !rules) throw new Error('目标 Schema 接口尚未就绪');
+        snapshot.schemaGuard = rules?.assertCurrent;
+        const schemaReconciler = window.MVU2LEDGER_CORE.getMvuSchemaFactory()(window.__MVU2LEDGER_SCHEMA_ENGINE_LIBS__.lodash);
+        const schema = rules?.schema || stateTransfer.resolveImportSchema(snapshot.mvu.schema, schemaReconciler.generateSchema);
+        const target = stateTransfer.stat(snapshot.mvu.stat_data);
+        const accept = async (path, value) => {
+            if (rules) return rules.accept(path, value);
+            if (!schema && !snapshot.converted) return '目标没有公开可独立校验的字段规则，保留目标值';
+            return '';
+        };
+        async function project(value) {
+            if (!snapshot.converted) return snapshot.tables;
+            const candidate = await buildUpdatedTemplateFromStat(snapshot.layout, nativeStatStorage.split(target).database,
+                nativeStatStorage.split(value).database, snapshot.tables);
+            if (!candidate) throw new Error('无法将状态映射到目标表格');
+            const readback = window.MVU2LEDGER_CORE.statDataFromTables(snapshot.layout, candidate);
+            const merged = nativeStatStorage.combine(readback?.stat_data || {}, nativeStatStorage.split(value).native);
+            if (!stateTransfer.equal(stateTransfer.stat(merged), value)) throw new Error('目标布局无法无损保存这份 stat_data');
+            return candidate;
+        }
+        const candidate = await stateTransfer.prepareImport(archive.stat_data, target, {
+            schema, accept, project, layoutOnly: snapshot.converted && !schema && !rules,
+            validateComplete: rules ? value => rules.validateComplete(value) : null,
+        });
+        const fields = candidate.fields, importedStat = candidate.stat_data;
+        let tables = candidate.tables;
+        if (fields?.partial && !fields.imported.length && !extras.matches.length) throw new Error('没有可安全导入的兼容字段或额外表格；未写入数据');
+        assertStateTransferUnchanged(snapshot);
+        tables = stateTransfer.applyExtras(tables, extras.matches);
+        const targetMvu = { ...snapshot.mvu, stat_data: stateTransfer.clone(importedStat) };
+        schemaReconciler.reconcileAndApplySchema(targetMvu);
+        const nativeStat = snapshot.converted ? nativeStatStorage.split(importedStat).native : importedStat;
+        const variables = { ...snapshot.raw, stat_data: stateTransfer.clone(nativeStat),
+            ...(targetMvu.schema !== undefined ? { schema: targetMvu.schema } : {}),
+            initialized_lorebooks: stateTransfer.clone(snapshot.mvu.initialized_lorebooks || {}), display_data: stateTransfer.clone(nativeStat), delta_data: {} };
+        return { archive, snapshot, tables, variables, extras, fields, importedStat, backup: true, writeTables: snapshot.converted || extras.matches.length > 0 };
+    }
+    async function commitStateTransferImport(plan) {
+        throw new Error("台账适配测试版暂不开放旧状态导入，请新建聊天。");
+        const { snapshot } = plan;
+        let broadcastSuppressed = false;
+        const rollbackStage = async () => {
+            const current = snapshot.helper.getVariables(snapshot.variableOption);
+            if (stateTransfer.equal(current, snapshot.raw)) return;
+            if (!stateTransfer.equal(current, plan.variables)) throw new Error('消息变量已被其他操作修改，未强制覆盖');
+            snapshot.helper.replaceVariables(stateTransfer.clone(snapshot.raw), snapshot.variableOption);
+        };
+        if (plan.writeTables && typeof snapshot.api?.importTableAsJson !== 'function') throw new Error('数据库公开状态导入接口不可用');
+        await stateTransfer.execute(plan, {
+            rollbackStage,
+            assertCurrent: () => { assertRuntimeSession(snapshot.session); snapshot.schemaGuard?.(); },
+            assertUnchanged: () => assertStateTransferUnchanged(snapshot),
+            backup: async () => {
+                stateTransferProgress('正在保存并备份完整聊天…');
+                await saveStateTransferChat(snapshot);
+                assertStateTransferUnchanged(snapshot);
+                const jsonl = await exportStateTransferChat(snapshot);
+                assertStateTransferUnchanged(snapshot);
+                stateTransfer.verifyBackup(jsonl, snapshot.chat, snapshot.metadata);
+                download(stateTransferFilename(snapshot.source.chat, '-覆盖前备份.jsonl'), 'application/jsonl', jsonl);
+            },
+            stage: async () => {
+                stateTransferProgress('正在导入状态…');
+                sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded = (Number(sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded) || 0) + 1;
+                broadcastSuppressed = true;
+                snapshot.helper.replaceVariables(stateTransfer.clone(plan.variables), snapshot.variableOption);
+                return rollbackStage;
+            },
+            importTables: tables => snapshot.api.importTableAsJson(JSON.stringify(tables), { persist: true }),
+            restoreTables: async () => {
+                const current = await waitStateTransferTableRead(snapshot.api, snapshot.session, stateTransferTableNames(snapshot.tables));
+                if (stateTransfer.equalRuntimeTables(current, snapshot.tables)) return;
+                if (!stateTransfer.equalRuntimeTables(current, plan.tables)) throw new Error('表格状态与本次候选不一致，未强制覆盖；请检查并手动恢复');
+                const result = await snapshot.api.importTableAsJson(JSON.stringify(snapshot.tables), { persist: true });
+                if (result !== true && result?.success !== true) throw new Error('数据库拒绝回退');
+            },
+            // importTableAsJson 的持久提交已保存同一份暂存变量；沿用现有批量写入
+            // 契约，成功时不再次保存并触发宿主重新加载。失败回退仍明确保存。
+            save: recovering => !plan.writeTables || recovering ? saveStateTransferChat(snapshot) : Promise.resolve(),
+            verify: async () => {
+                const variables = snapshot.helper.getVariables(snapshot.variableOption);
+                if (!stateTransfer.equal(variables, plan.variables)) throw new Error('消息变量读回不一致');
+                if (plan.writeTables) {
+                    const current = await waitStateTransferTableRead(snapshot.api, snapshot.session, stateTransferTableNames(plan.tables));
+                    if (snapshot.converted) {
+                        const wrap = mvuDataFromCompleteTableSnapshot(current, snapshot.index, true);
+                        if (!wrap || !stateTransfer.equal(stateTransfer.stat(wrap.stat_data), plan.importedStat)) throw new Error('数据库状态读回不一致');
+                    }
+                    for (const match of plan.extras.matches) if (!stateTransfer.equal(current[match.key]?.content, match.content)) throw new Error('额外表格读回不一致：' + match.name);
+                }
+                const context = getContextSafe(), chat = stateTransfer.clone(context.chat), metadata = stateTransfer.clone(context.chatMetadata || context.chat_metadata || {});
+                stateTransferProgress('正在确认聊天已保存…');
+                const jsonl = await exportStateTransferChat(snapshot);
+                stateTransfer.verifyBackup(jsonl, chat, metadata);
+                if (!stateTransfer.equal(chat, getContextSafe().chat)) throw new Error('保存核对期间聊天又发生更新');
+            },
+        }).finally(() => {
+            if (broadcastSuppressed) sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded = Math.max(0, (Number(sharedStateWindow.__mvu2ledgerSuppressTableMvuEnded) || 0) - 1);
+            invalidateStatProjectionCache();
+        });
+        if (snapshot.converted) {
+            refreshOpeningContinuityAfterWrite(snapshot.source.chat, plan.importedStat);
+            publishCommittedTableSnapshot(snapshot.api.exportTableAsJson(), '手动导入状态', true, true, true);
+        }
+    }
+    async function confirmStateTransferImport(plan) {
+        const context = getContextSafe(), text = [];
+        text.push('目标角色：' + plan.snapshot.source.character, '目标聊天：' + plan.snapshot.source.chat,
+            '目标存储：' + (plan.snapshot.variableOption.type === 'chat' ? '聊天变量（沿用原卡位置）' : '消息变量（最新 AI 消息的选中分支）'),
+            '覆盖当前状态，保留其他消息和分支。',
+            (plan.snapshot.converted ? 'stat_data 已通过目标布局的无损读回预检。' : '已检查 stat_data JSON 结构。') + '沿用目标 Schema 规则和初始化标记，不重跑作者初始化或变换。');
+        if (plan.archive.source?.character && plan.archive.source.character !== plan.snapshot.source.character) text.push('源角色与目标角色名称不同，请确认变量含义相容。');
+        text.push('额外表格匹配：' + (plan.extras.matches.map(t => t.name).join('、') || '无'));
+        for (const skip of plan.extras.skipped) text.push('跳过 ' + skip.name + '：' + skip.reason);
+        if (plan.fields?.partial) {
+            text.push('无法完整导入，将仅导入兼容字段。未匹配或不相容的字段保留目标值；不会猜测字段改名或拼接数组。',
+                '可导入字段：' + (plan.fields.imported.join('、') || '无'),
+                '旧存档缺少，保留目标字段：' + (plan.fields.retained.join('、') || '无'));
+            for (const skip of plan.fields.skipped) text.push('跳过 ' + skip.path + '：' + skip.reason);
+        }
+        text.push('聊天备份为可选项；选中时，写入前保存并下载完整 JSONL（不包含外置世界书、角色脚本或全局设置）。');
+        if (!context.callGenericPopup || !context.POPUP_TYPE) throw new Error('酒馆确认弹窗接口不可用');
+        const escaped = text.join('\n\n').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        const html = '<h3>导入状态预览</h3><div style="text-align:left;white-space:pre-wrap;overflow-wrap:anywhere;max-height:55vh;overflow-y:auto">' + escaped + '</div>'
+            + '<label style="display:flex;align-items:center;gap:.5em;text-align:left;margin-top:1em"><input type="checkbox" id="mvu2ledger-state-backup" checked>导入前下载完整聊天备份</label>';
+        return await context.callGenericPopup(html, context.POPUP_TYPE.CONFIRM, '', {
+            okButton: plan.fields?.partial ? '仅导入兼容字段' : '导入', cancelButton: '取消',
+            onClosing: popup => { plan.backup = popup.content.querySelector('#mvu2ledger-state-backup')?.checked !== false; return true; },
+        }) === 1;
+    }
+    async function stateTransferAction(task) {
+        if (stateTransferBusy) return;
+        stateTransferBusy = true; stateTransferProgress('正在读取状态…');
+        try { await task(); }
+        catch (e) { stateTransferProgress('操作失败：' + e.message); toast('状态存档：' + e.message, 'error'); }
+        finally { stateTransferBusy = false; stateTransferProgress(hostDocument.querySelector('#mvu2ledger-state-progress')?.textContent || ''); }
+    }
+
+    function bindSettingsPanel(panel, context) {
+        const bind = (id, fn) => {
+            const el = panel.querySelector(id);
+            if (el && el.dataset.bound !== 'true') {
+                el.dataset.bound = 'true';
+                el.addEventListener('click', fn);
+            }
+        };
+        bind('#mvu2ledger-export-state', () => stateTransferAction(async () => {
+            const snapshot = await captureStateTransferSnapshot();
+            const archive = stateTransfer.archive(snapshot);
+            assertStateTransferUnchanged(snapshot);
+            download(stateTransferFilename(snapshot.source.character, '-状态.json'), 'application/json', JSON.stringify(archive, null, 2));
+            stateTransferProgress('状态已导出，额外表格 ' + archive.extraTables.length + ' 张。');
+        }));
+        bind('#mvu2ledger-import-state', () => { if (!stateTransferBusy) panel.querySelector('#mvu2ledger-state-file')?.click(); });
+        const stateFile = panel.querySelector('#mvu2ledger-state-file');
+        if (stateFile && stateFile.dataset.bound !== 'true') {
+            stateFile.dataset.bound = 'true';
+            stateFile.addEventListener('change', () => {
+                const file = stateFile.files?.[0]; stateFile.value = ''; if (!file) return;
+                stateTransferAction(async () => {
+                    if (file.size > 64 * 1024 * 1024) throw new Error('状态存档超过 64 MiB');
+                    const plan = await prepareStateTransferImport(await file.text());
+                    stateTransferProgress('等待确认导入…');
+                    if (!await confirmStateTransferImport(plan)) { stateTransferProgress('已取消导入。'); return; }
+                    await commitStateTransferImport(plan);
+                    stateTransferProgress((plan.fields?.partial ? '兼容字段导入完成；跳过字段 ' + plan.fields.skipped.length + ' 个，保留目标字段 ' + plan.fields.retained.length + ' 个；' : '状态导入完成；') + '匹配额外表格 ' + plan.extras.matches.length + ' 张，跳过 ' + plan.extras.skipped.length + ' 张。');
+                });
+            });
+        }
+        stateTransferProgress(panel.querySelector('#mvu2ledger-state-progress')?.textContent || '');
+        populateCharacterSelect(panel);
+        startCharacterListRefresh(panel);
+        populateProfileSelect(panel);
+        populateMergeSource(panel);
+        const searchBox = panel.querySelector('#mvu2ledger-char-search');
+        if (searchBox && searchBox.dataset.bound !== 'true') {
+            searchBox.dataset.bound = 'true';
+            searchBox.addEventListener('input', () => populateCharacterSelect(panel));
+        }
+        bind('#mvu2ledger-char-refresh', async () => {
+            try {
+                const latest = getContextSafe();
+                if (typeof latest.getCharacters === 'function') await latest.getCharacters();
+                populateCharacterSelect(panel);
+                const count = Array.isArray(getContextSafe().characters) ? getContextSafe().characters.length : 0;
+                toast('角色列表已刷新，共 ' + count + ' 张', 'success');
+            } catch (e) { toast('刷新角色列表失败：' + (e && e.message ? e.message : e), 'error'); }
+        });
+        const profileSel = panel.querySelector('#mvu2ledger-profile-select');
+        if (profileSel && profileSel.dataset.bound !== 'true') {
+            profileSel.dataset.bound = 'true';
+            profileSel.addEventListener('change', () => {
+                activeProfileName = profileSel.value || '';
+                // 转换完后又切到另一配置，不能把旧结果覆盖进新选配置。
+                activeProfileAppliedToLastResult = false;
+                const del = panel.querySelector('#mvu2ledger-profile-delete');
+                if (del) del.disabled = !activeProfileName;
+            });
+        }
+        bind('#mvu2ledger-profile-delete', () => {
+            if (!activeProfileName) return;
+            if (!hostWindow.confirm('确定删除转换配置「' + activeProfileName + '」？\n不会删除角色卡或数据库预设。')) return;
+            delete conversionProfiles()[activeProfileName];
+            activeProfileName = '';
+            activeProfileAppliedToLastResult = false;
+            saveSettings();
+            populateProfileSelect(panel);
+            toast('转换配置已删除', 'success');
+        });
+        // 输入来源二选一：切换时只显示对应来源区域，并启用对应的转换按钮
+        const applySource = (value) => {
+            const isChar = value === 'character';
+            const charArea = panel.querySelector('#mvu2ledger-char-area');
+            const fileArea = panel.querySelector('#mvu2ledger-file-area');
+            const btnCurrent = panel.querySelector('#mvu2ledger-convert-current');
+            const btnFile = panel.querySelector('#mvu2ledger-convert-file');
+            if (charArea) charArea.style.display = isChar ? '' : 'none';
+            if (fileArea) fileArea.style.display = isChar ? 'none' : '';
+            // 二选一：只显示当前来源对应的转换按钮
+            if (btnCurrent) { btnCurrent.style.display = isChar ? '' : 'none'; btnCurrent.disabled = !isChar; }
+            if (btnFile) { btnFile.style.display = isChar ? 'none' : ''; btnFile.disabled = isChar; }
+        };
+        const sourceRadios = panel.querySelectorAll('input[name="mvu2ledger-source"]');
+        sourceRadios.forEach((radio) => {
+            if (radio.dataset.bound !== 'true') {
+                radio.dataset.bound = 'true';
+                radio.addEventListener('change', () => { if (radio.checked) applySource(radio.value); });
+            }
+        });
+        const checkedSource = panel.querySelector('input[name="mvu2ledger-source"]:checked');
+        applySource(checkedSource ? checkedSource.value : 'character');
+        bind('#mvu2ledger-convert-current', async () => {
+            const ch = selectedCharacter(panel);
+            if (!ch) { toast('请先在角色卡下拉栏中选择角色', 'error'); return; }
+            toast('正在转换…');
+            try {
+                const full = await fetchFullCharacter(ch);
+                if (!full) {
+                    toast('获取角色卡完整数据失败（接口可能被其他扩展改写），请重试', 'error');
+                    return;
+                }
+                console.log('[mvu2ledger] 待转换对象：name=', full && full.name, '| keys=', Object.keys(full || {}).join(','), '| character_book.entries=', full && full.character_book ? full.character_book.entries.length : 'N/A');
+                await doConvert(full, false, ch);
+            } catch (e) {
+                toast('转换失败：' + (e && e.message ? e.message : e), 'error');
+            }
+        });
+        bind('#mvu2ledger-pick-file', () => {
+            const input = panel.querySelector('#mvu2ledger-file');
+            if (input) input.click();
+        });
+        const fileInput = panel.querySelector('#mvu2ledger-file');
+        if (fileInput && fileInput.dataset.bound !== 'true') {
+            fileInput.dataset.bound = 'true';
+            fileInput.addEventListener('change', () => {
+                const nameEl = panel.querySelector('#mvu2ledger-file-name');
+                if (nameEl) nameEl.textContent = fileInput.files && fileInput.files.length ? '已选择：' + fileInput.files[0].name : '';
+            });
+        }
+        bind('#mvu2ledger-convert-file', async () => {
+            const input = panel.querySelector('#mvu2ledger-file');
+            if (!input || !input.files || !input.files.length) { toast('请先选择文件', 'error'); return; }
+            const file = input.files[0];
+            toast('正在转换 ' + file.name + ' …');
+            try {
+                const bytes = await readFileAsBytes(file);
+                const isPng = /\.png$/i.test(file.name) || (bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50);
+                await doConvert(bytes, isPng);
+            } catch (e) {
+                toast('转换失败：' + (e && e.message ? e.message : e), 'error');
+            }
+        });
+        bind('#mvu2ledger-clear', () => {
+            lastResult = null;
+            const box = panel.querySelector('.mvu2ledger-result');
+            if (box) box.innerHTML = '';
+            const saveBtn = panel.querySelector('#mvu2ledger-save-card');
+            if (saveBtn) saveBtn.style.display = 'none';
+            const downloadsBox = panel.querySelector('#mvu2ledger-downloads');
+            if (downloadsBox) downloadsBox.innerHTML = '';
+            mergeState.sourceTemplate = null;
+            const tablesBox = panel.querySelector('#mvu2ledger-merge-tables');
+            if (tablesBox) tablesBox.innerHTML = '选择来源后点「加载表列表」，勾选要并入转换结果（角色卡模板）的表；重名表会自动跳过。';
+            const applyBtn = panel.querySelector('#mvu2ledger-merge-apply');
+            if (applyBtn) applyBtn.style.display = 'none';
+            const statusEl = panel.querySelector('#mvu2ledger-merge-status');
+            if (statusEl) statusEl.textContent = '';
+        });
+        bind('#mvu2ledger-save-card', async () => {
+            await saveCardToSillyTavern();
+        });
+        const shimSel = panel.querySelector('#mvu2ledger-shim');
+        if (shimSel && shimSel.dataset.bound !== 'true') {
+            shimSel.dataset.bound = 'true';
+            shimSel.addEventListener('change', () => {
+                getSettings().installMvuShim = shimSel.value;
+                saveSettings();
+            });
+        }
+        const ph = panel.querySelector('#mvu2ledger-placeholder');
+        if (ph && ph.dataset.bound !== 'true') {
+            ph.dataset.bound = 'true';
+            ph.addEventListener('change', () => {
+                getSettings().appendPlaceholder = ph.checked;
+                saveSettings();
+            });
+        }
+        const debugBox = panel.querySelector('#mvu2ledger-debug');
+        if (debugBox && debugBox.dataset.bound !== 'true') {
+            debugBox.dataset.bound = 'true';
+            debugBox.addEventListener('change', () => {
+                getSettings().debug = debugBox.checked;
+                try {
+                    if (typeof window !== 'undefined') window.__mvu2ledgerDebug = debugBox.checked;
+                } catch (e) {}
+                saveSettings();
+            });
+        }
+        const ddlCheckBox = panel.querySelector('#mvu2ledger-ddl-check');
+        if (ddlCheckBox && ddlCheckBox.dataset.bound !== 'true') {
+            ddlCheckBox.dataset.bound = 'true';
+            ddlCheckBox.addEventListener('change', () => {
+                getSettings().ddlIncludeCheck = ddlCheckBox.checked;
+                saveSettings();
+                if (lastResult) {
+                    toast('DDL CHECK 开关已保存；重新转换后生效（现有转换结果不变）', 'info');
+                }
+            });
+        }
+        const jsonContainersBox = panel.querySelector('#mvu2ledger-json-containers');
+        if (jsonContainersBox && jsonContainersBox.dataset.bound !== 'true') {
+            jsonContainersBox.dataset.bound = 'true';
+            jsonContainersBox.addEventListener('change', () => {
+                getSettings().jsonContainers = jsonContainersBox.checked;
+                saveSettings();
+                if (lastResult) toast('完整 JSON 容器选项已保存；重新转换后生效', 'info');
+            });
+        }
+        const ejsTranslateBox = panel.querySelector('#mvu2ledger-ejs-translate');
+        if (ejsTranslateBox && ejsTranslateBox.dataset.bound !== 'true') {
+            ejsTranslateBox.dataset.bound = 'true';
+            ejsTranslateBox.addEventListener('change', () => {
+                getSettings().translateSimpleEjs = ejsTranslateBox.checked;
+                saveSettings();
+            });
+        }
+        const pngSel = panel.querySelector('#mvu2ledger-png');
+        if (pngSel && pngSel.dataset.bound !== 'true') {
+            pngSel.dataset.bound = 'true';
+            pngSel.addEventListener('change', () => {
+                getSettings().asPng = pngSel.value;
+                saveSettings();
+            });
+        }
+    }
+
+    function ensureSettingsPanel(context) {
+        const mount = findSettingsMount();
+        if (!mount) {
+            hostWindow.clearTimeout(state.timer);
+            state.timer = hostWindow.setTimeout(() => ensureSettingsPanel(context), 1500);
+            return;
+        }
+        let panel = hostDocument.getElementById(PANEL_ID);
+        if (!panel) {
+            panel = hostDocument.createElement('section');
+            panel.id = PANEL_ID;
+            panel.className = PLUGIN_ID + '-settings';
+            renderSettingsPanel(panel);
+            mount.appendChild(panel);
+        }
+        bindSettingsPanel(panel, context);
+    }
+
+    // 调试钩子：确认 st-prompt-template 每次构建的 EJS 上下文是否包含我们的函数
+    let defineTimer = null;
+    function resolvePromptMacroRuntime(body) {
+        const raw = '{{' + String(body == null ? '' : body) + '}}';
+        try {
+            const context = getContextSafe();
+            if (context && typeof context.substituteParams === 'function') return String(context.substituteParams(raw));
+        } catch (e) {}
+        for (const root of [window, hostWindow]) {
+            try { if (root && typeof root.substituteParams === 'function') return String(root.substituteParams(raw)); } catch (e) {}
+        }
+        return raw;
+    }
+    function applyWorldInfoRegexRuntime(scriptName, encodedOriginal, encodedReplacement, initiallyEnabled) {
+        let enabled = !!initiallyEnabled;
+        let original = '';
+        try {
+            original = mvu2ledgerDecodeB64(String(encodedOriginal || ''));
+            const ch = currentCharacter();
+            const ext = charExtensions(ch);
+            const scripts = ext && Array.isArray(ext.regex_scripts) ? ext.regex_scripts : [];
+            const found = scripts.find(r => String(r && r.scriptName || '') === String(scriptName || ''));
+            if (found) enabled = !found.disabled;
+            if (!enabled) return original;
+            const replacement = mvu2ledgerDecodeB64(String(encodedReplacement || ''));
+            const context = getContextSafe();
+            if (context && typeof context.substituteParams === 'function') return String(context.substituteParams(replacement));
+            if (!/\{\{[\s\S]*?\}\}/.test(replacement)) return replacement;
+        } catch (e) {}
+        return original;
+    }
+    function hasDatabaseMessageData(index) {
+        const chat = getContextSafe().chat || [];
+        // Unchanged AI replies and user messages inherit the preceding database
+        // state even when no new storage frame was required on that floor.
+        for (let i = index; i >= 0; i--) {
+            let isolated = chat[i] && chat[i].TavernDB_ACU_IsolatedData;
+            if (typeof isolated === 'string') { try { isolated = JSON.parse(isolated); } catch (_) { continue; } }
+            if (isolated && typeof isolated === 'object' && Object.values(isolated).some(tag =>
+                tag && tag.storageFrame && tag.storageFrame.version === 2)) return true;
+        }
+        return false;
+    }
+    function readDatabaseMessageHistory(index) {
+        const wrap = databaseMessageHistory.read(index);
+        return wrap ? nativeStatStorage.merge(wrap, index) : undefined;
+    }
+    const databaseMessageHistory = window.MVU2LEDGER_CORE.getMessageHistoryFactory()({
+        readApi: getAcuApi,
+        readChat: () => getContextSafe().chat || [],
+        readSessionKey: () => { const session = captureRuntimeSession(); return session.key + ':' + session.epoch; },
+        readLayoutKey: () => activeLayout,
+        yieldToHost: () => new Promise(resolve => hostWindow.setTimeout(resolve, 0)),
+        project: (tables, index) => mvuDataFromCompleteTableSnapshot(tables, index, true, false),
+        readFallback: index => {
+            const tables = readPersistedTableData(index);
+            return tables ? mvuDataFromCompleteTableSnapshot(tables, index) : undefined;
+        },
+        onError: error => dbgWarn(' 历史状态准备失败:', error),
+    });
+    async function prepareDatabaseHistory(context) {
+        if (!isConvertedMvuCard(currentCharacter()) || !ensureActiveLayoutLazy()) return;
+        const chat = getContextSafe().chat || [];
+        const latest = ejsEvalBridge.selectMessage().index;
+        const indices = [];
+        let inherited = false;
+        for (let index = 0; index < chat.length; index++) {
+            if (!inherited) inherited = hasDatabaseMessageData(index);
+            if (inherited && index !== latest) indices.push(index);
+        }
+        if (!indices.length) return;
+        try { await databaseMessageHistory.prepare(indices); }
+        catch (error) {
+            // A later damaged frame must not stop current reads or an earlier
+            // valid render. The host truncates a selected-floor retry itself.
+            const target = ejsEvalBridge.selectMessage({}, context || {});
+            if (!target.missing && !target.current) await databaseMessageHistory.prepare([target.index]);
+            else dbgWarn(' 历史状态批次准备失败:', error);
+        }
+    }
+    function scheduleDatabaseHistoryPreparation() {
+        if (databaseHistoryPrepareTimer !== null) hostWindow.clearTimeout(databaseHistoryPrepareTimer);
+        databaseHistoryPrepareTimer = hostWindow.setTimeout(() => {
+            databaseHistoryPrepareTimer = null;
+            prepareDatabaseHistory().catch(error => dbgWarn(' 提交后历史状态准备失败:', error));
+        }, 120);
+    }
+    function databaseVariableTarget(options, writing) {
+        const messageId = options && options.message_id;
+        return ejsEvalBridge.selectMessage(messageId == null || messageId === 'latest'
+            ? {} : { withMsg: { id: messageId } }, {}, writing);
+    }
+    function readDatabaseVariables(options) {
+        const target = databaseVariableTarget(options, false);
+        if (target.missing) return {};
+        if (!target.current) return readDatabaseMessageHistory(target.index) || {};
+        const all = pendingStatWrite ? { stat_data: pendingStatWrite, display_data: {}, delta_data: {}, initialized_lorebooks: {} }
+            : window.getAllVariables ? window.getAllVariables() : { stat_data: {} };
+        assertMvuReadReady(all);
+        return all;
+    }
+    function assertDatabaseMessageWrite(options) {
+        ejsEvalBridge.assertWritable(databaseVariableTarget(options, true));
+    }
+    function templateDatabaseDefines(context, execution) {
+        const safeDefine = function () { return variables.getvar(null); };
+        const variables = ejsEvalBridge.createVariableContext(ejsVariablesSafe, scheduleWindowStatOverlay, context || {}, execution || { refreshReads: !context });
+        const getMessageDefine = variables.getMessageVar;
+        const setMessageDefine = variables.setMessageVar;
+        const formatMessageDefine = function (path) {
+                    const coreNow = window.MVU2LEDGER_CORE;
+                    return coreNow && typeof coreNow.formatMessageVariableValue === 'function'
+                        ? coreNow.formatMessageVariableValue(getMessageDefine(path))
+                        : '';
+        };
+        const resolveMacroDefine = function (body) { return resolvePromptMacroRuntime(body); };
+        const applyWorldInfoRegexDefine = function (name, original, encodedReplacement, initiallyEnabled) {
+            return applyWorldInfoRegexRuntime(name, original, encodedReplacement, initiallyEnabled);
+        };
+        const defines = {
+            mvu2ledgerGetAllVariables: safeDefine,
+            mvu2ledgerGetMessageVar: getMessageDefine,
+            mvu2ledgerGetVar: variables.getvar,
+            mvu2ledgerSetVar: variables.setvar,
+            mvu2ledgerFormatMessageVariable: formatMessageDefine,
+            mvu2ledgerVwdDescriptions: function (table, fieldIds) {
+                if (!ensureActiveLayoutLazy()) throw new Error('动态说明布局尚未就绪');
+                const entry = activeLayout.find(item => item && item.table === table && item.vwd && item.vwd.promptVersion === 1);
+                if (!entry || JSON.stringify(entry.vwd.fields.map(field => field.id)) !== JSON.stringify(fieldIds)) {
+                    throw new Error('动态说明模板不属于当前布局');
+                }
+                const api = getAcuApi();
+                // 一次读取一张表的所有说明，不读取 pendingStatWrite，也不重建完整变量树。
+                const tables = api && typeof api.exportTableAsJson === 'function' ? api.exportTableAsJson() : null;
+                const sheet = Object.values(tables || {}).find(item => item && item.name === table);
+                return window.MVU2LEDGER_CORE.vwdPromptDescriptions(entry, sheet);
+            },
+            mvu2ledgerSetMessageVar: setMessageDefine,
+            mvu2ledgerResolveMacro: resolveMacroDefine,
+            mvu2ledgerApplyWorldInfoRegex: applyWorldInfoRegexDefine,
+        };
+        if (context && isConvertedMvuCard(currentCharacter())) {
+            Object.assign(defines, variables);
+            const descriptor = Object.getOwnPropertyDescriptor(context, 'variables');
+            if (!descriptor || descriptor.configurable) Object.defineProperty(context, 'variables', {
+                configurable: true, enumerable: true, get: () => variables.variableView(),
+            });
+        }
+        for (const fn of Object.values(defines)) fn.__mvu2ledger = true;
+        return defines;
+    }
+    const ejsEvalBridge = window.MVU2LEDGER_CORE.getEjsEvalBridgeFactory()({
+        readCharacter: currentCharacter,
+        isConverted: () => isConvertedMvuCard(currentCharacter()),
+        readCore: () => window.MVU2LEDGER_CORE,
+        makeDefines: templateDatabaseDefines,
+        pathParts: mvuVariablePathParts,
+        readChat: () => getContextSafe().chat || [],
+        readSessionKey: () => { const session = captureRuntimeSession(); return session.key + ":" + session.epoch; },
+        hasMessageData: hasDatabaseMessageData,
+        readHistory: readDatabaseMessageHistory,
+        prepareHistory: prepareDatabaseHistory,
+        readTemplate: () => window.EjsTemplate || hostWindow.EjsTemplate,
+        onWriteError: error => dbgWarn(' EJS 数据库变量写入失败:', error),
+        lodash: window._ || hostWindow._,
+    });
+    function ensureEjsEvalContextBridge(ejs) { return ejsEvalBridge.install(ejs); }
+    function ensureTemplateDefine() {
+        try {
+            const roots = [];
+            const addRoot = (w) => { try { if (w && roots.indexOf(w) === -1) roots.push(w); } catch (e) {} };
+            addRoot(window); addRoot(hostWindow);
+            try { addRoot(window.parent); } catch (e) {}
+            try { addRoot(window.top); } catch (e) {}
+            let installed = false;
+            for (const w of roots) {
+                const ejs = w && w.EjsTemplate;
+                if (!ejs) continue;
+                if (ejs.defines && typeof ejs.defines === 'object') Object.assign(ejs.defines, templateDatabaseDefines());
+                if (ensureEjsEvalContextBridge(ejs) || (ejs.defines && typeof ejs.defines === 'object')) installed = true;
+            }
+            if (installed) {
+                dbg(' 扩展侧注册 EJS 数据库读写函数完成');
+                defineTimer = null;
+            } else if (!defineTimer) {
+                defineTimer = hostWindow.setTimeout(() => { defineTimer = null; ensureTemplateDefine(); }, 2000);
+            }
+        } catch (e) {
+            dbgWarn(' 扩展侧注册异常:', e);
+        }
+    }
+    function installFrontendEjsLiteralGuard(prepared) {
+        if (!prepared || prepared.runType !== 'render' || typeof prepared.activateRegex !== 'function') return;
+        const character = currentCharacter();
+        if (!character || !isConvertedMvuCard(character)) return;
+        const core = window.MVU2LEDGER_CORE;
+        if (!core || typeof core.protectFrontendEjsLiterals !== 'function') return;
+        const chatKey = autoInitChatId(), cardKey = cardCacheKey(character);
+        // 使用提示词模板公开的临时 HTML 正则阶段，不改楼层原文、全局设置或远端资源。
+        prepared.activateRegex(/[\s\S]+/g, text => {
+            const current = currentCharacter();
+            if (!current || !isConvertedMvuCard(current) || autoInitChatId() !== chatKey || cardCacheKey(current) !== cardKey) return text;
+            return core.protectFrontendEjsLiterals(text);
+        }, { uuid: 'mvu2ledger-frontend-ejs-literals', basic: false, message: true, generate: false,
+            before: false, after: false, html: true, order: 100000, sticky: 0 });
+    }
+
+    function bindDebugHooks(context) {
+        const es = context && (context.eventSource || context.event_source);
+        if (!es || typeof es.on !== 'function') return;
+        try {
+            // 只在首次 prepare 时打一行确认，避免每次生成都刷屏
+            let firstPreparedLogged = false;
+            es.on('prompt_template_prepare', async (prepared) => {
+                // defines 是插件级默认上下文；填表插件会自行调用
+                // evalTemplate(finalContent)，不同窗口/缓存时它可能不带当前 defines。
+                // prepare 事件上再直接注入实际执行上下文，避免任意一个 helper
+                // ReferenceError 使 SP 整份提示退回未处理原文。
+                await prepareDatabaseHistory(prepared);
+                if (prepared && typeof prepared === 'object') Object.assign(prepared, templateDatabaseDefines(prepared));
+                installFrontendEjsLiteralGuard(prepared);
+                if (firstPreparedLogged) return;
+                firstPreparedLogged = true;
+                const pageEjs = (typeof window !== 'undefined' && window.EjsTemplate) || null;
+                dbg(
+                    'prompt_template_prepare 首次上下文: 键数=' + (prepared ? Object.keys(prepared).length : 0) +
+                    ' | getvar=' + typeof (prepared && prepared.getvar) +
+                    ' | mvu2ledgerGetAllVariables=' + typeof (prepared && prepared.mvu2ledgerGetAllVariables) +
+                    ' | getAllVariables=' + typeof (prepared && prepared.getAllVariables) +
+                    ' | 页面EjsTemplate=' + !!pageEjs +
+                    ' | 页面defines注册函数=' + typeof (pageEjs && pageEjs.defines && pageEjs.defines.mvu2ledgerGetAllVariables)
+                );
+            });
+            dbg(' 已监听 prompt_template_prepare 事件（仅首次打印上下文）');
+        } catch (e) {
+            dbgWarn(' 监听 prompt_template_prepare 失败:', e);
+        }
+    }
+
+    function registerMagicWandRefreshButton(retry) {
+        const attempt = Number(retry) || 0;
+        try {
+            const doc = hostDocument || document;
+            const menu = doc && (doc.getElementById('extensionsMenu') || doc.getElementById('extensions_menu'));
+            if (!menu) {
+                if (attempt < 30) hostWindow.setTimeout(() => registerMagicWandRefreshButton(attempt + 1), 2000);
+                return;
+            }
+            const id = 'mvu2ledger-refresh-frontend-menu-item';
+            let button = doc.getElementById(id);
+            if (!button) {
+                button = doc.createElement('div');
+                button.id = id;
+                button.className = 'list-group-item flex-container flexGap5 interactable';
+                button.setAttribute('role', 'listitem');
+                button.setAttribute('tabindex', '0');
+                button.setAttribute('title', '重读当前转换卡的状态栏/整页前端');
+                button.innerHTML = '<div class="fa-fw fa-solid fa-rotate extensionsMenuExtensionButton"></div><span>刷新转换卡前端</span>';
+                menu.appendChild(button);
+            }
+            if (button.dataset.mvu2ledgerBound === 'true') return;
+            button.dataset.mvu2ledgerBound = 'true';
+            button.addEventListener('click', (event) => {
+                try { event.stopPropagation(); } catch (e) {}
+                let converted = !!activeLayout;
+                try { converted = converted || isConvertedMvuCard(currentCharacter()); } catch (e) {}
+                if (!converted) {
+                    toast('当前角色卡不是 MVU转台账 的转换产物', 'warning');
+                    return;
+                }
+                // 先重申运行时兼容对象，再让前端读取，也能修复晚创建 iframe 的 Mvu 等待。
+                try { applyWindowMvuShim(); } catch (e) {}
+                const result = refreshCurrentCardFrontends();
+                const count = result.direct + result.event + result.control + result.reload;
+                if (count > 0) toast('已刷新转换卡前端（直接 ' + result.direct + '、事件 ' + result.event + '、控件 ' + result.control + '、重载 ' + result.reload + '）', 'success');
+                else toast('已广播 MVU 刷新事件；当前前端未声明可确认的重读入口', 'info');
+            });
+        } catch (e) {
+            if (attempt < 10) hostWindow.setTimeout(() => registerMagicWandRefreshButton(attempt + 1), 1000);
+        }
+    }
+
+    function main() {
+        if (runtimeRegistry.ready) {
+            const ready = runtimeRegistry.ready;
+            // 保留 barrier 到结算为止，避免等待中二次启动绕过在途调用。
+            if (!runtimeRegistry.starting) {
+                runtimeRegistry.starting = true;
+                ready.then(() => { runtimeRegistry.ready = null; main(); })
+                    .catch(error => console.error('[mvu2ledger] 旧桥退出或接管初始化失败:', error));
+            }
+            return;
+        }
+        const context = getContextSafe();
+        // 按设置初始化 debug 全局标记（dbg/dbgWarn 都读它）
+        try {
+            const s = getSettings();
+            if (typeof window !== 'undefined') window.__mvu2ledgerDebug = !!s.debug;
+        } catch (e) {}
+        installEarlyEventOnFallback();
+        activateRuntimeRegistry();
+        ensureSettingsPanel(context);
+        registerMagicWandRefreshButton(0);
+        bindDebugHooks(context);
+        ensureTemplateDefine();
+        // 卡内桥在 TH 沙箱中可能被隔离，运行时由扩展兜底（仅对本转换器产物生效）：
+        // - 建表：只在当前聊天缺表时 initGameSession（每聊天 done 去重一次，绝不重建/重置已有表格）；
+        // - Mvu 兼容：把前端 MVU API 调用翻译成数据库操作；
+        // - 占位符：消息收尾补 <StatusPlaceHolderImpl/> 供前端正则注入。
+        // 不做锚点重建、不做切聊天时的表管理；Mvu 接管/getAllVariables/表格广播都只对带
+        // extensions.mvu2ledger 独有标记的卡生效，切到其他卡时全部撤销。
+        syncRuntimeForCurrentCard();
+        bindAutoInit(context);
+        hostWindow.setTimeout(autoInitDatabase, 1500);
+        const ejs = (typeof window !== 'undefined' && window.EjsTemplate) || null;
+        dbg(
+            '加载时 EjsTemplate=' + !!ejs +
+            ' | defines=' + !!(ejs && ejs.defines) +
+            ' | 已注册 mvu2ledgerGetAllVariables=' + typeof (ejs && ejs.defines && ejs.defines.mvu2ledgerGetAllVariables)
+        );
+        console.log('[mvu2ledger] 扩展已加载（' + (window.MVU2LEDGER_CORE ? window.MVU2LEDGER_CORE.VERSION : '核心缺失') +
+            ' | 写路径=CRUD 差量 / 原子快照 | 持久化由数据库插件负责）');
+    }
+
+    try {
+        main();
+    } catch (error) {
+        console.error('[mvu2ledger] 初始化失败:', error);
+        try {
+            if (hostWindow.toastr && typeof hostWindow.toastr.error === 'function') {
+                hostWindow.toastr.error(error && error.message ? error.message : String(error), 'MVU转台账');
+            }
+        } catch (e) {}
+    }
+}
+
+/* ================================================================
+ * 候选快照构造（可独立调用）
+ * 只依赖注入的 core，不安装事件、不选聊天、不碰宿主数据；扩展运行时与公开合成测试
+ * 调用的是同一份实现——测试不需要复制源码，也不用替身预检替代真实函数。
+ * ================================================================ */
+// 与运行时同源：宿主表格单元格只接受字符串/数字，布尔归一化为 1/0。
+function createCandidateBuilderFactory(deps) {
+    'use strict';
+    const { core = null, debug: dbg = () => {}, warn: dbgWarn = () => {} } = deps || {};
+    const coreNow = core;
+
+    // 必须留在工厂内：浏览器通过 toString 内联时没有 Node 模块外部作用域。
+    function normalizeCellForSync(v) {
+        if (v === null || v === undefined) return '';
+        if (typeof v === 'boolean') return v ? 1 : 0;
+        if (typeof v === 'number') return v;
+        if (typeof v === 'string') return v;
+        try { return JSON.stringify(v); } catch (e) { return String(v); }
+    }
+
+    // 旧 MVU/VWD 在 message stat_data 中可能仍保留 [值, 描述] 叶子。
+    // 开场分支快照合并发生在建表前；若直接把这个数组交给数据库，
+    // TEXT 列会得到 [值,描述] JSON 字符串，并与枚举 CHECK 冲突。
+    // 仅依 layout 中明确的 pair 列拆包，真实 array/object 字段保持不变。
+    function collapseLegacyPairLeaves(stat, layoutEntries) {
+        const out = JSON.parse(JSON.stringify(stat && typeof stat === 'object' ? stat : {}));
+        const getParent = (parts) => {
+            let cur = out;
+            for (let i = 0; i < parts.length - 1; i++) {
+                if (!cur || typeof cur !== 'object') return null;
+                cur = cur[parts[i]];
+            }
+            return cur && typeof cur === 'object' ? cur : null;
+        };
+        for (const L of (Array.isArray(layoutEntries) ? layoutEntries : [])) {
+            if (L && L.vwd && L.vwd.promptVersion === 1) continue;
+            for (const col of (L && Array.isArray(L.cols) ? L.cols : [])) {
+                if (!Array.isArray(col) || !['pair', 'jsonPairOptional'].includes(col[1]) || !Array.isArray(col[3]) || !col[3].length) continue;
+                const parts = col[3].map(String);
+                const parent = getParent(parts);
+                const key = parts[parts.length - 1];
+                const value = parent && parent[key];
+                if (Array.isArray(value) && value.length === 2 && typeof value[1] === 'string') {
+                    parent[key] = value[0];
+                }
+            }
+        }
+        return out;
+    }
+
+    // VWD 登记字段的说明差量必须在**折叠之前**用原始数据判定：折叠会丢掉 pair 的第二项，
+    // 候选构造若只看折叠后的数据就会漏掉说明变化，产出“新值 + 旧说明”的错误候选。
+    // 这里只做检查并在发现问题时整笔拒绝；放行后仍走原有的折叠兼容路径。
+    function vwdDescriptionRejection(core, layoutEntries, prevStat, nextStat, tables) {
+        if (!core || typeof core.vwdDescriptionDelta !== 'function') return '';
+        const unsupported = (layoutEntries || []).filter(entry => !core.canWriteVwdDescriptions
+            || !core.canWriteVwdDescriptions(entry, tables));
+        return core.vwdDescriptionDelta(unsupported, prevStat, nextStat) || '';
+    }
+
+    // 开场候选与当前回复批次共用内存适配器。只在草稿中执行真实 writer，
+    // 记录其最终 API 调用，不另写一套字段/数组/关联变更规划器。
+
+    async function planCurrentReplyWrites(api, layoutEntries, prevStat, nextStat, persistedTables) {
+        const plan = await coreNow.planStatDiffToDb(api, layoutEntries, prevStat, nextStat, persistedTables);
+        if (!plan.ok) throw Object.assign(new Error('当前回复批次规划失败，未调用宿主写入：' + plan.failureReason), { code: plan.failureCode });
+        return plan;
+    }
+
+    function buildUpdatedTemplateFromStat(layoutEntries, prevStat, nextStat, baseTemplate) {
+        if (!coreNow || typeof coreNow.writeStatDiffToDbResult !== 'function' || typeof coreNow.statDataFromTables !== 'function') return null;
+        const rejection = vwdDescriptionRejection(coreNow, layoutEntries, prevStat, nextStat, baseTemplate);
+        if (rejection) {
+            dbgWarn(' VWD 说明变化无法与提示词同步，候选构造已在任何写入前拒绝：' + rejection);
+            return null;
+        }
+        const { tables, fakeApi } = coreNow.createStatTableDraft(baseTemplate);
+        const normalizedPrevStat = collapseLegacyPairLeaves(prevStat, layoutEntries);
+        const normalizedNextStat = collapseLegacyPairLeaves(nextStat, layoutEntries);
+        // 内存模板必须先追平当前数据库状态，再应用 prev→next。本次调用可能只带
+        // 某组的部分字段；若直接从原始模板应用差异，未变化字段会停留在模板默认值，
+        // 随后的整表 initGameSession 会把已有进度回滚。
+        const baseWrap = coreNow.statDataFromTables(layoutEntries, tables);
+        const baseStat = baseWrap && baseWrap.stat_data && typeof baseWrap.stat_data === 'object'
+            ? baseWrap.stat_data
+            : {};
+        return Promise.resolve(coreNow.writeStatDiffToDbResult(fakeApi, layoutEntries, baseStat, normalizedPrevStat, tables))
+            .then(result => {
+                if (!result.ok) throw Object.assign(new Error('构建开场模板失败：无法追平当前数据库快照：' + result.failureReason), { code: result.failureCode });
+                return coreNow.writeStatDiffToDbResult(fakeApi, layoutEntries, normalizedPrevStat, normalizedNextStat, tables);
+            })
+            .then(result => {
+                if (!result.ok) throw Object.assign(new Error('构建开场模板失败：无法应用当前开场快照：' + result.failureReason), { code: result.failureCode });
+                return tables;
+            });
+    }
+
+
+    return {
+        buildUpdatedTemplateFromStat,
+        planCurrentReplyWrites,
+        collapseLegacyPairLeaves,
+        vwdRejectionReason: (layoutEntries, prevStat, nextStat, tables) => vwdDescriptionRejection(coreNow, layoutEntries, prevStat, nextStat, tables),
+    };
+}
+
+// 酒馆的请求级 lore 列表与数据库直接读取的原世界书互相独立。
+// 工厂同时供真实运行时与无外部作用域的 VM 回归使用。
+function createEjsEvalBridgeFactory(deps) {
+    'use strict';
+    const { readCharacter, readCore, makeDefines } = deps;
+    const lodash = deps.lodash || (typeof globalThis !== 'undefined' && globalThis._)
+        || (typeof require === 'function' ? require('./vendor/schema-engine-libs').lodash : null);
+    const pathParts = deps.pathParts || (path => lodash.toPath(path));
+    const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key);
+    function failure(code, message) {
+        const error = new Error(message);
+        error.code = code;
+        return error;
+    }
+    function optionObject(value) {
+        if (typeof value === 'boolean') return { dryRun: value };
+        if (typeof value === 'string') {
+            if (['old', 'new', 'fullcache'].includes(value)) return { results: value };
+            if (['n', 'nx', 'xx', 'nxs', 'xxs'].includes(value)) return { flags: value };
+            if (['cache', 'initial', 'global', 'local', 'message'].includes(value)) return { scope: value };
+            return {};
+        }
+        return value && typeof value === 'object' ? { ...value } : {};
+    }
+    function jsonIndex(value) {
+        const numeric = Number(value);
+        return Number.isNaN(numeric) ? value : numeric;
+    }
+    function selectMessage(options = {}, context = {}, writing = false) {
+        const chat = deps.readChat ? deps.readChat() : null;
+        const filter = options.withMsg;
+        if (!Array.isArray(chat)) {
+            if (filter || context.message_id != null) throw failure('MVU_HISTORY_UNAVAILABLE', '数据库消息历史尚未就绪');
+            return { current: true };
+        }
+        let latest = -1;
+        for (let i = chat.length - 1; i >= 0; i--) {
+            if (chat[i] && !chat[i].is_user && !chat[i].is_system) { latest = i; break; }
+        }
+        let index = latest;
+        if (filter && filter.id != null) {
+            index = Number(filter.id);
+            if (index < 0) index += chat.length;
+        } else if (filter && filter.role != null) {
+            // Retain the host selector's boolean-role matching contract, including
+            // its overlapping user/system tests; do not silently tighten it here.
+            const eligible = msg => filter.role === 'any'
+                || msg.is_system === (filter.role === 'system')
+                || msg.is_user === (filter.role === 'user')
+                || (filter.role === 'assistant' && !msg.is_user && !msg.is_system);
+            index = -1;
+            for (let i = chat.length - 1; i >= 0; i--) {
+                if (chat[i] && eligible(chat[i]) && (writing || !deps.hasMessageData || deps.hasMessageData(i))) { index = i; break; }
+            }
+        } else if (context.message_id != null) {
+            index = Number(context.message_id);
+            if (index < 0) index += chat.length;
+            if (index > chat.length) index = chat.length - 1;
+            if (!writing && deps.hasMessageData) {
+                while (index >= 0 && !deps.hasMessageData(index)) index--;
+            }
+        }
+        if (!Number.isInteger(index) || index < 0 || index >= chat.length) return { missing: true, current: false };
+        const message = chat[index];
+        let swipe = filter && filter.swipe_id != null ? Number(filter.swipe_id)
+            : context.swipe_id != null ? Number(context.swipe_id) : Number(message.swipe_id || 0);
+        if (swipe < 0) swipe += Array.isArray(message.swipes) ? message.swipes.length : 0;
+        if (!Number.isInteger(swipe) || swipe < 0) return { missing: true, current: false };
+        if (swipe !== Number(message.swipe_id || 0)) {
+            throw failure('MVU_HISTORY_SWIPE_UNSUPPORTED', '数据库未提供未选中 swipe 的独立快照，不能改读当前 swipe');
+        }
+        return { index, swipe, current: index === latest };
+    }
+    function assertWritable(target) {
+        if (!target || target.missing || !target.current) {
+            throw failure('MVU_HISTORY_WRITE_UNSUPPORTED', '数据库公开接口不支持任意历史消息写入；已阻止修改当前状态');
+        }
+    }
+    function createVariableContext(readVariables, writeStat, context = {}, execution = {}) {
+        const original = {};
+        for (const name of ['getvar', 'getMessageVar', 'setvar', 'setMessageVar', 'incvar', 'incMessageVar', 'decvar', 'decMessageVar', 'delvar', 'delMessageVar', 'insvar', 'insertMessageVar', 'patchVariables']) {
+            const fn = context[name];
+            original[name] = fn && fn.__mvu2ledgerVariableAdapter ? fn.__mvu2ledgerVariableOriginal : fn;
+        }
+        const sessionKey = deps.readSessionKey && deps.readSessionKey();
+        const assertSession = () => {
+            if (deps.readSessionKey && deps.readSessionKey() !== sessionKey) throw failure('MVU_VARIABLE_CONTEXT_STALE', '变量执行上下文所属聊天已改变，已停止数据库操作');
+        };
+        let cache = null;
+        const currentData = () => readVariables() || {};
+        const selectionContext = options => execution.publicEval && !options.withMsg ? {} : context;
+        const read = (options, writing = false) => {
+            assertSession();
+            // withMsg selects a persisted message only for message-scoped reads
+            // or writes. Native cache reads/cache-only writes ignore this filter.
+            const selected = options.scope === 'cache' || (!writing && options.scope !== 'message')
+                ? { ...options, withMsg: undefined } : options;
+            const target = selectMessage(selected, selectionContext(selected), writing);
+            if (target.missing) return undefined;
+            if (!target.current) {
+                if (!deps.readHistory) throw failure('MVU_HISTORY_UNAVAILABLE', '数据库消息历史尚未就绪');
+                return deps.readHistory(target.index, target.swipe);
+            }
+            if (!writing && options.scope === 'message' && options.withMsg) return lodash.cloneDeep(currentData());
+            if (options.noCache || execution.refreshReads || !cache) cache = lodash.cloneDeep(currentData());
+            return cache;
+        };
+        const delegate = (name, args) => {
+            if (typeof original[name] !== 'function') throw failure('MVU_NATIVE_VARIABLE_API_UNAVAILABLE', '宿主原变量接口尚未就绪：' + name);
+            return original[name].apply(context, args);
+        };
+        const databasePath = path => {
+            if (typeof path !== 'string' && !Array.isArray(path)) return null;
+            const parts = pathParts(path, {});
+            return parts[0] === 'stat_data' ? parts : null;
+        };
+        const useDatabase = (parts, options) => parts && !['global', 'local', 'initial'].includes(options.scope);
+        function getter(name, forcedScope) {
+            const fn = function (path, rawOptions) {
+                const options = optionObject(rawOptions);
+                if (forcedScope) options.scope = forcedScope;
+                if (path == null && !['global', 'local', 'initial'].includes(options.scope)) {
+                    const native = typeof original[name] === 'function' ? delegate(name, arguments) : {};
+                    return { ...(native || {}), ...(read(options) || {}) };
+                }
+                const parts = databasePath(path);
+                if (!useDatabase(parts, options)) return delegate(name, arguments);
+                const all = read(options);
+                let result = lodash.get(all, parts, options.defaults);
+                if (options.index != null) {
+                    const data = JSON.parse(result || '{}');
+                    // The host cache branch uses Number(index) even for named keys;
+                    // explicit message scope falls back to the original string.
+                    return lodash.get(data, options.scope === 'message' ? jsonIndex(options.index) : Number(options.index), options.defaults);
+                }
+                return options.clone && options.scope === 'message' ? lodash.cloneDeep(result) : result;
+            };
+            fn.__mvu2ledgerVariableOriginal = original[name];
+            fn.__mvu2ledgerVariableAdapter = true;
+            return fn;
+        }
+        function setter(name, forcedScope) {
+            const fn = function (path, value, rawOptions) {
+                const options = optionObject(rawOptions);
+                if (forcedScope) options.scope = forcedScope;
+                if (path == null && value && own(value, 'stat_data') && !['global', 'local', 'initial'].includes(options.scope)) {
+                    throw failure('MVU_BULK_VARIABLE_WRITE_UNSUPPORTED', '整份变量表包含数据库变量，不能通过原生批量写入绕过数据库');
+                }
+                const parts = databasePath(path);
+                if (!useDatabase(parts, options)) return delegate(name, arguments);
+                if (parts.some(key => ['__proto__', 'constructor', 'prototype'].includes(key))) {
+                    throw failure('MVU_VARIABLE_PATH_UNSAFE', '禁止写入原型属性');
+                }
+                assertSession();
+                if (!options.dryRun && (execution.publicEval ? false : context.isDryRun)) return undefined;
+                const scope = options.scope || 'message';
+                if (!['message', 'cache'].includes(scope)) throw failure('MVU_VARIABLE_SCOPE_UNSUPPORTED', '不支持的数据库变量作用域：' + scope);
+                if (scope === 'message') assertWritable(selectMessage(options, selectionContext(options), true));
+                const all = read(options, true) || {};
+                let container = all, field = parts;
+                if (options.index != null) {
+                    container = JSON.parse(lodash.get(all, parts, '{}') || '{}');
+                    field = lodash.toPath(jsonIndex(options.index));
+                    if (field.some(key => ['__proto__', 'constructor', 'prototype'].includes(key))) throw failure('MVU_VARIABLE_PATH_UNSAFE', '禁止写入原型属性');
+                }
+                const previous = lodash.get(container, field);
+                const exists = lodash.has(container, field);
+                if ((options.flags === 'nx' && exists) || (options.flags === 'xx' && !exists)
+                    || (options.flags === 'nxs' && getter('getvar')(path, options) !== undefined)
+                    || (options.flags === 'xxs' && getter('getvar')(path, options) === undefined)) return undefined;
+                let nextValue = value;
+                if (options.merge) {
+                    nextValue = Array.isArray(value) && (previous === undefined || Array.isArray(previous))
+                        ? lodash.concat(previous ?? [], value)
+                        : lodash.mergeWith(lodash.cloneDeep(previous ?? {}), value, (_old, incoming) => Array.isArray(incoming) ? incoming : undefined);
+                }
+                const next = lodash.cloneDeep(all);
+                if (options.index != null) {
+                    if (nextValue === undefined) lodash.unset(container, field);
+                    else lodash.set(container, field, nextValue);
+                    lodash.set(next, parts, JSON.stringify(container));
+                } else if (nextValue === undefined) lodash.unset(next, parts);
+                else lodash.set(next, parts, nextValue);
+                if (scope === 'message' && (!next.stat_data || typeof next.stat_data !== 'object' || Array.isArray(next.stat_data))) {
+                    throw failure('MVU_VARIABLE_ROOT_INVALID', 'stat_data 必须是对象，不能删除或写成标量');
+                }
+                if (scope === 'message') {
+                    // Cache-only edits and mutations of cached references must not
+                    // hitchhike on a later write to an unrelated field.
+                    const persisted = lodash.cloneDeep(currentData());
+                    if (options.index != null && options.withMsg) {
+                        const stored = JSON.parse(lodash.get(persisted, parts, '{}') || '{}');
+                        if (nextValue === undefined) lodash.unset(stored, field);
+                        else lodash.set(stored, field, nextValue);
+                        const encoded = JSON.stringify(stored);
+                        lodash.set(persisted, parts, encoded);
+                        lodash.set(next, parts, encoded);
+                    } else if (options.index != null) lodash.set(persisted, parts, lodash.get(next, parts));
+                    else if (nextValue === undefined) lodash.unset(persisted, parts);
+                    else lodash.set(persisted, parts, nextValue);
+                    // The native setter is synchronous. Keep read-after-write visible;
+                    // persistence uses the existing guarded, coalesced write pipeline.
+                    const pending = writeStat(persisted.stat_data);
+                    if (pending && typeof pending.catch === 'function') pending.catch(error => { if (deps.onWriteError) deps.onWriteError(error); });
+                    cache = next;
+                } else cache = next;
+                if (options.results === 'old') return previous;
+                if (options.results === 'fullcache') {
+                    const nativeVariables = context.variables || {};
+                    return { ...nativeVariables, ...(cache || currentData()) };
+                }
+                return nextValue;
+            };
+            fn.__mvu2ledgerVariableOriginal = original[name];
+            fn.__mvu2ledgerVariableAdapter = true;
+            return fn;
+        }
+        const result = { getvar: getter('getvar'), getMessageVar: getter('getMessageVar', 'message'),
+            setvar: setter('setvar'), setMessageVar: setter('setMessageVar', 'message') };
+        function shortcut(name, operation, forcedScope) {
+            const fn = function (path, value, indexOrOptions, rawOptions) {
+                const raw = operation === 'insert' ? rawOptions : indexOrOptions;
+                const options = optionObject(raw);
+                if (name === 'delMessageVar') value = { ...(value || {}), scope: 'message' };
+                if (forcedScope && name !== 'delMessageVar') {
+                    if (operation === 'increase' || operation === 'decrease') options.outscope = forcedScope;
+                    else options.scope = forcedScope;
+                }
+                const parts = databasePath(path);
+                const outputScope = options.outscope || options.scope;
+                if (!parts || ['global', 'local', 'initial'].includes(outputScope)) return delegate(name, arguments);
+                if (operation === 'increase' || operation === 'decrease') {
+                    const lookup = { index: options.index, withMsg: options.withMsg, scope: options.inscope, noCache: options.noCache };
+                    const current = result.getvar(path, lookup);
+                    const present = lodash.has(read({ noCache: options.noCache }), parts);
+                    const shouldWrite = { n: true, nx: !present, xx: present, nxs: current === undefined, xxs: current !== undefined }[options.flags || 'n'];
+                    if (!shouldWrite) return undefined;
+                    let next = result.getvar(path, { ...lookup, defaults: options.defaults || 0 })
+                        + (operation === 'decrease' ? -(value === undefined ? 1 : value) : value === undefined ? 1 : value);
+                    if (options.min != null) next = Math.max(next, options.min);
+                    if (options.max != null) next = Math.min(next, options.max);
+                    return result.setvar(path, next, { ...options, scope: options.outscope, flags: 'n' });
+                }
+                if (operation === 'delete' && value == null) return result.setvar(path, undefined, options);
+                const current = lodash.cloneDeep(result.getvar(path, options));
+                if (operation === 'delete') {
+                    if (Array.isArray(current)) {
+                        const index = current.indexOf(value);
+                        if (index < 0) return undefined;
+                        current.splice(index, 1);
+                    } else if (current && typeof current === 'object') {
+                        delete current[String(value)];
+                    } else if (typeof current === 'string' && typeof value === 'string') {
+                        if (!current.includes(value)) return undefined;
+                        throw new TypeError('宿主 delvar 的字符串分支调用了不存在的 splice 方法');
+                    } else return undefined;
+                } else {
+                    const index = indexOrOptions;
+                    if (Array.isArray(current)) {
+                        if (index == null) current.push(value);
+                        else current.splice(Number(index) < 0 ? current.length + Number(index) : Number(index), 0, value);
+                    } else if (current && typeof current === 'object' && index != null) {
+                        if (['__proto__', 'constructor', 'prototype'].includes(String(index))) throw failure('MVU_VARIABLE_PATH_UNSAFE', '禁止写入原型属性');
+                        const exists = own(current, String(index));
+                        if ((String(options.flags).includes('nx') && exists) || (String(options.flags).includes('xx') && !exists)) return undefined;
+                        current[String(index)] = value;
+                    } else if (typeof current === 'string') {
+                        if (index == null) return result.setvar(path, current + value.toString(), options);
+                        if (typeof index === 'string' && !current.includes(index)) return result.setvar(path, current, options);
+                        throw new TypeError('宿主 insvar 的字符串分支调用了不存在的 splice 方法');
+                    } else return undefined;
+                }
+                return result.setvar(path, current, options);
+            };
+            fn.__mvu2ledgerVariableOriginal = original[name];
+            fn.__mvu2ledgerVariableAdapter = true;
+            return fn;
+        }
+        for (const [name, operation, scope] of [
+            ['incvar', 'increase'], ['incMessageVar', 'increase', 'message'],
+            ['decvar', 'decrease'], ['decMessageVar', 'decrease', 'message'],
+            ['delvar', 'delete'], ['delMessageVar', 'delete', 'message'],
+            ['insvar', 'insert'], ['insertMessageVar', 'insert', 'message'],
+        ]) result[name] = shortcut(name, operation, scope);
+        result.patchVariables = function (path, patch, options) {
+            if (path == null && !['global', 'local', 'initial'].includes(optionObject(options).scope)) {
+                const ejs = deps.readTemplate && deps.readTemplate();
+                const operations = typeof patch === 'string' && ejs ? ejs.parseJSON(patch) : patch;
+                if (!Array.isArray(operations) || operations.some(op => [op && op.path, op && op.from].some(value => typeof value === 'string' && /^\/stat_data(?:\/|$)/.test(value)))) {
+                    throw failure('MVU_BULK_VARIABLE_WRITE_UNSUPPORTED', '整份变量表补丁包含数据库变量，不能通过原生写入绕过数据库');
+                }
+            }
+            if (!useDatabase(databasePath(path), optionObject(options))) return delegate('patchVariables', arguments);
+            const ejs = deps.readTemplate && deps.readTemplate();
+            if (!ejs || typeof ejs.jsonPatch !== 'function') throw failure('MVU_NATIVE_JSON_PATCH_UNAVAILABLE', '宿主公开 jsonPatch 接口尚未就绪');
+            return result.setvar(path, ejs.jsonPatch(result.getvar(path, options), typeof patch === 'string' ? ejs.parseJSON(patch) : patch), options);
+        };
+        result.patchVariables.__mvu2ledgerVariableOriginal = original.patchVariables;
+        result.patchVariables.__mvu2ledgerVariableAdapter = true;
+        Object.defineProperty(result, 'variableView', { value: () => {
+            const native = typeof original.getvar === 'function' ? delegate('getvar', [null]) : {};
+            const target = native && typeof native === 'object' ? native : {};
+            return new Proxy(target, {
+                get: (object, key) => key === 'stat_data' ? result.getvar('stat_data') : Reflect.get(object, key),
+                set: (object, key, value) => {
+                    if (key === 'stat_data') { result.setvar('stat_data', value, { scope: 'cache' }); return true; }
+                    return Reflect.set(object, key, value);
+                },
+                deleteProperty: (object, key) => {
+                    if (key === 'stat_data') { result.setvar('stat_data', undefined, { scope: 'cache' }); return true; }
+                    return Reflect.deleteProperty(object, key);
+                },
+                ownKeys: object => [...new Set([...Reflect.ownKeys(object), 'stat_data'])],
+                getOwnPropertyDescriptor: (object, key) => key === 'stat_data'
+                    ? { configurable: true, enumerable: true, writable: true, value: result.getvar('stat_data') }
+                    : Reflect.getOwnPropertyDescriptor(object, key),
+            });
+        } });
+        return result;
+    }
+    function createMessageGetter(readVariables, context = {}) {
+        return createVariableContext(readVariables, () => {}, context, { refreshReads: true }).getMessageVar;
+    }
+    function createMessageSetter(readVariables, writeStat, context = {}) {
+        return createVariableContext(readVariables, writeStat, context).setMessageVar;
+    }
+    function install(ejs) {
+        if (!ejs || typeof ejs.evalTemplate !== 'function') return false;
+        if (ejs.evalTemplate.__mvu2ledgerContextBridge) return true;
+        const original = ejs.evalTemplate;
+        const wrapped = async function (code, context, options) {
+            const core = readCore();
+            // DB calls evalTemplate(finalContent) without a context. The private
+            // guide call and current converted-card metadata must also agree.
+            // Body/preview/world_info calls supply their own execution context.
+            const view = context == null && core && typeof core.prepareFillPrompt === 'function'
+                ? core.prepareFillPrompt(code, readCharacter()) : { text: code, adapted: false };
+            if (!view.adapted && !/\bmvu2ledger(?:GetAllVariables|GetMessageVar|GetVar|SetVar|FormatMessageVariable|VwdDescriptions|SetMessageVar|ResolveMacro|ApplyWorldInfoRegex)\b/.test(String(code || ''))
+                && !(deps.isConverted && deps.isConverted() && String(code || '').includes('<%')))
+                return original.apply(this, arguments);
+            const defines = makeDefines();
+            let actualContext = context;
+            if (!actualContext || typeof actualContext !== 'object') {
+                // Public EjsTemplate API: prepareContext(context, end=-1).
+                // The internal function reverses these arguments.
+                actualContext = typeof ejs.prepareContext === 'function' ? await ejs.prepareContext(defines, -1) : {};
+            }
+            // Per invocation: no shared mutable group, dice or guide cache.
+            if (deps.prepareHistory) await deps.prepareHistory(actualContext);
+            Object.assign(actualContext, makeDefines(actualContext, { publicEval: context == null }));
+            return original.call(this, view.text, actualContext, options);
+        };
+        wrapped.__mvu2ledger = true;
+        wrapped.__mvu2ledgerContextBridge = true;
+        wrapped.__mvu2ledgerOriginal = original;
+        ejs.evalTemplate = wrapped;
+        return true;
+    }
+    return { install, createMessageGetter, createMessageSetter, createVariableContext, selectMessage, assertWritable };
+}
+
+function createWorldbookRequestFilterFactory(deps) {
+    'use strict';
+    const { readCharacter, readExtensions = ch => ch && ((ch.data || ch).extensions || ch.extensions),
+        readWorldbook = ch => ch && ((ch.data || ch).character_book || ch.character_book) } = deps;
+    let boundSource = null, boundEvent = '';
+    function filter(lores) {
+        const character = readCharacter();
+        const extensions = readExtensions(character) || {};
+        if (extensions.mvu2ledger?.converter !== 'mvu2ledger') return;
+        const book = readWorldbook(character);
+        const primary = typeof extensions.world === 'string' && extensions.world.trim() ? extensions.world : book && book.name;
+        const names = new Set(typeof primary === 'string' && primary ? [primary] : []);
+        if (!names.size || !lores || typeof lores !== 'object') return;
+        for (const key of ['globalLore', 'characterLore', 'chatLore', 'personaLore']) {
+            const entries = lores[key];
+            if (!Array.isArray(entries)) continue;
+            for (let i = entries.length - 1; i >= 0; i--) {
+                const entry = entries[i];
+                if (entry && names.has(entry.world) && /\[(?:mvu_update|M2SJK)\]/i.test(String(entry.comment || '')) &&
+                    !/\[mvu_plot\]/i.test(String(entry.comment || ''))) entries.splice(i, 1);
+            }
+        }
+    }
+    function stop() {
+        if (boundSource && typeof boundSource.removeListener === 'function') boundSource.removeListener(boundEvent, filter);
+        else if (boundSource && typeof boundSource.off === 'function') boundSource.off(boundEvent, filter);
+        boundSource = null; boundEvent = '';
+    }
+    function bind(context) {
+        const source = context && (context.eventSource || context.event_source);
+        const types = context && (context.event_types || context.eventTypes);
+        const event = types && types.WORLDINFO_ENTRIES_LOADED || 'worldinfo_entries_loaded';
+        if (!source || typeof source.on !== 'function' || source === boundSource && event === boundEvent) return;
+        stop(); source.on(event, filter); boundSource = source; boundEvent = event;
+    }
+    return { filter, bind, stop };
+}
+
+module.exports = installExtensionRuntime;
+module.exports.createCandidateBuilder = createCandidateBuilderFactory;
+
+module.exports.createWorldbookRequestFilter = createWorldbookRequestFilterFactory;
+module.exports.createEjsEvalBridge = createEjsEvalBridgeFactory;

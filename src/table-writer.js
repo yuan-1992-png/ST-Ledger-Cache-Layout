@@ -1,0 +1,1699 @@
+'use strict';
+
+/**
+ * 将 stat_data 差异适配为插件原生 CRUD。
+ * 宿主 API、布局、快照均显式传入；模块不安装事件、不选择聊天、不保存宿主。
+ * 主接口返回本次写入结果；数字返回和 lastStatWriteFailed 仅供旧调用兼容。
+ * plannedChanges 是计划数而非成功数；宿主写库仍由调用方串行调度。
+ */
+function createTableWriter(dependencies) {
+    const { parseJson: safeParseJson, readCachedTemplate = () => null,
+        debugOn: mvu2ledgerDebugOn = () => false,
+        // 调用方验证对应布局、真实 note 和运行期渲染能力。缺少能力仍整笔拒绝。
+        vwdNoteSyncSupported: vwdNoteSync = () => false,
+        debug: dbg = () => {}, warn: dbgWarn = () => {}, projectStat = value => value, readStatFromTables } = dependencies;
+    if (typeof safeParseJson !== 'function') throw new Error('写入模块需要 JSON 解析函数');
+    let statWriteHadFailure = false;
+    function unmappedStatGroups(layout, previous, next) {
+        // A declared root container owns the source root itself. Its display
+        // group name is not a source variable; callers may pass raw stat_data.
+        if ((layout || []).some(entry => entry.publicFallback || entry.rootContainer)) return [];
+        const mapped = new Set((Array.isArray(layout) ? layout : []).flatMap(entry => {
+            const kind = entry.kind;
+            const paths = entry.writePaths && entry.writePaths.length ? entry.writePaths : [entry.path && entry.path.length ? entry.path : [entry.group]];
+            return paths.map(path => path[0]);
+        }));
+        return Object.keys(next || {}).filter(key => !mapped.has(key) && key !== '$internal' && key !== '$meta'
+            && JSON.stringify(next[key]) !== JSON.stringify((previous || {})[key]));
+    }
+    async function runStatDiffWrite(api, layoutEntries, prevStat, nextStat, persistedTables, writeState) {
+        let abortWrites = false;
+        const noteWriteFailure = (reason) => {
+            writeState.failed = true;
+            if (writeState.failureReason === null) writeState.failureReason = reason;
+        };
+        const markWriteFailure = (label, error) => {
+            noteWriteFailure(error ? label + ': ' + (error.message || String(error)) : label);
+            abortWrites = true;
+            if (error) dbgWarn(' ' + label + ' 失败:', error);
+            else dbgWarn(' ' + label + ' 返回失败结果。');
+        };
+        const entries = Array.isArray(layoutEntries) ? layoutEntries : [];
+        for (const entry of entries) {
+            if (entry.requiredSourceRoot && !Object.prototype.hasOwnProperty.call(nextStat || {}, entry.requiredSourceRoot)) {
+                writeState.failureCode = 'MVU_STAT_REPRESENTATION_UNSUPPORTED';
+                noteWriteFailure('精细布局无法无损表示必需变量「' + entry.requiredSourceRoot + '」的缺失状态；已拒绝写入并保留原数据');
+                return 0;
+            }
+        }
+        try { prevStat = projectStat(prevStat, entries); nextStat = projectStat(nextStat, entries); }
+        catch (error) { noteWriteFailure(error.message); return 0; }
+        const unmapped = unmappedStatGroups(entries, prevStat, nextStat);
+        if (unmapped.length) { noteWriteFailure('存在未映射的变量组：' + unmapped.join('、')); return 0; }
+        // 登记、更新和新增共用同一判定，避免标量化的数字/布尔 pair 只在更新路径识别。
+        const pairColumnType = col => {
+            if (!Array.isArray(col)) return '';
+            const type = col[1];
+            return ['pair', 'jsonPairOptional'].includes(type)
+                || (col[4] === true && ['number', 'boolean'].includes(type)) ? type : '';
+        };
+        // 操作路径始终保留字面段；记录键中的点号和空字符串不是路径语法。
+        const pathParts = path => Array.isArray(path) ? path : String(path || '').split('.');
+        const pathKey = path => JSON.stringify(pathParts(path));
+        const tableEntryByPath = (pathStr) => {
+            let best = null;
+            const pp = pathParts(pathStr);
+            for (const L of entries) {
+                if (L.kind === 'array') {
+                    if (pp.length === 1 && pp[0] === L.group) return { layout: L, kind: 'array' };
+                    continue;
+                }
+                if (L.kind === 'pathArray') {
+                    const prefix = L.path || [];
+                    if (pp.length === prefix.length && prefix.every((part, i) => pp[i] === part)) return { layout: L, kind: L.kind, prefix };
+                    continue;
+                }
+                if (L.kind === 'nestedArray') {
+                    const p = L.path || [];
+                    if (pp.length === 3 && pp[0] === L.group && p.length && pp[2] === p[p.length - 1]) {
+                        return { layout: L, kind: L.kind, prefix: [pp[0], pp[1], pp[2]] };
+                    }
+                    continue;
+                }
+                if (L.kind === 'nestedRows') {
+                    const pattern = (L.writePaths && L.writePaths[0]) || [...(L.parentPath || [L.group]), '*', L.childKey];
+                    // 集合路径本身也要路由到关系表，随后递归到条目/字段；若要求必须
+                    // 已带条目键，上一层行表会先把整个集合误判成 _扩展数据。
+                    const matches = pp.length >= pattern.length && pattern.every((p, i) => p === '*' || pp[i] === p);
+                    if (matches) {
+                        const prefix = pattern.map((p, i) => p === '*' ? pp[i] : p);
+                        const ancestorValues = pattern.map((p, i) => p === '*' ? pp[i] : undefined).filter(v => v !== undefined);
+                        if (!best || prefix.length > best.prefix.length) best = { layout: L, kind: L.kind, prefix, ancestorValues };
+                    }
+                    continue;
+                }
+                const prefix = L.kind === 'singleton' ? [L.group] : ((L.writePaths || [])[0] || [L.group]);
+                if (pp.length >= prefix.length && prefix.every((part, i) => pp[i] === part)) {
+                    // 最长前缀优先：避免单例组遮蔽其子表路径（如 主角.储物袋.* 应路由到子表）
+                    if (!best || prefix.length > best.prefix.length) best = { layout: L, kind: L.kind, prefix };
+                }
+            }
+            return best;
+        };
+        let tables = {};
+        try { tables = api.exportTableAsJson() || {}; } catch (e) {}
+        // 前端“渲染回写”抑制的辅助判定：`_` 前缀内部状态（如 _hypnoos）是否为“全默认/空”。
+        // version 键按“任何数字=默认”处理（schema 版本号），其余数字须为 0；
+        // 只要有任何真实内容（非空容器/true/非零值）即为非默认 → 允许落库（用户真实操作）。
+        const isStructurallyDefault = (v, isVersion) => {
+            if (v === undefined || v === null) return true;
+            if (typeof v === 'string') return v === '';
+            if (typeof v === 'boolean') return v === false;
+            if (typeof v === 'number') return isVersion ? true : v === 0;
+            if (Array.isArray(v)) return v.length === 0;
+            if (typeof v === 'object') {
+                for (const kk in v) {
+                    if (!isStructurallyDefault(v[kk], kk === 'version')) return false;
+                }
+                return true;
+            }
+            return false;
+        };
+        const sheetOf = (name) => {
+            for (const k in tables) {
+                if (k.indexOf('sheet_') === 0 && tables[k] && tables[k].name === name) return { key: k, sheet: tables[k] };
+            }
+            return null;
+        };
+        // 只在无写入的规划阶段复用行索引；执行阶段必须读取最新行位置。
+        const rowIndexes = new WeakMap();
+        let planningRows = true;
+        const indexedRow = (sheet, columns, values) => {
+            if (!sheet || !Array.isArray(sheet.content) || !sheet.content[0]) return -1;
+            const indexes = columns.map(col => sheet.content[0].indexOf(col));
+            if (indexes.some(index => index < 0)) return -1;
+            const key = JSON.stringify(values.map(String));
+            if (!planningRows) {
+                for (let i = 1; i < sheet.content.length; i++) {
+                    const row = sheet.content[i];
+                    if (row && indexes.every((index, j) => String(row[index]) === String(values[j]))) return i;
+                }
+                return -1;
+            }
+            let cache = rowIndexes.get(sheet);
+            if (!cache || cache.length !== sheet.content.length || cache.header !== sheet.content[0]) {
+                cache = { length: sheet.content.length, header: sheet.content[0], columns: new Map() };
+                rowIndexes.set(sheet, cache);
+            }
+            const signature = JSON.stringify(indexes);
+            let rows = cache.columns.get(signature);
+            if (!rows) {
+                rows = new Map();
+                for (let i = 1; i < sheet.content.length; i++) {
+                    const row = sheet.content[i];
+                    if (!row) continue;
+                    const rowKey = JSON.stringify(indexes.map(index => String(row[index])));
+                    if (!rows.has(rowKey)) rows.set(rowKey, i); // 重复键维持首次命中契约
+                }
+                cache.columns.set(signature, rows);
+            }
+            return rows.has(key) ? rows.get(key) : -1;
+        };
+        const findRowByColumn = (sheet, colName, value) => indexedRow(sheet, [colName], [value]);
+        const findRelationRow = (sheet, parentCol, parentValue, keyCol, keyValue) => {
+            return indexedRow(sheet, [parentCol, keyCol], [parentValue, keyValue]);
+        };
+        const findRelationRowByAncestors = (sheet, layout, ancestorValues, keyValue) => {
+            const cols = Array.isArray(layout.ancestorKeyCols) && layout.ancestorKeyCols.length ? layout.ancestorKeyCols : [layout.parentKeyCol];
+            return indexedRow(sheet, [...cols, layout.keyCol], [...cols.map((_, i) => (ancestorValues || [])[i]), keyValue]);
+        };
+        const sameValue = (a, b) => {
+            const na = a === undefined || a === null ? '' : a;
+            const nb = b === undefined || b === null ? '' : b;
+            // SP 单元格不能存布尔（SyncBridge 归一化 true→1/false→0），而快照/读回侧仍是
+            // 布尔。布尔与数字按数值等价比较，否则 1↔true 每轮都被判为差异，形成
+            // “写入 true → 存为 1 → 下轮再判差异”的回声（圣樱学院-RE 开场 19 条无效写）。
+            const aIsBool = typeof na === 'boolean';
+            const bIsBool = typeof nb === 'boolean';
+            if ((aIsBool || bIsBool) && (aIsBool || typeof na === 'number') && (bIsBool || typeof nb === 'number')) {
+                return Number(na) === Number(nb);
+            }
+            return String(na) === String(nb);
+        };
+        const ops = [];
+        /* ---------------- VWD 动态说明差量 ----------------
+         * 说明覆盖集合只保存与静态默认不同的条目；显式 "" 是有效覆盖。字段身份用布局
+         * 登记路径数组的 JSON 串，不用显示列名。值列类型、nullable/optional 与缺失语义
+         * 都不变，覆盖值只写进该表已登记的隐藏元数据列，绝不绕入 _扩展数据。
+         */
+        const vwdSlots = [];
+        for (const L of entries) {
+            if (!L || L.kind !== 'singleton') continue;
+            const fields = L.vwd && typeof L.vwd === 'object' && Array.isArray(L.vwd.fields) ? L.vwd.fields : null;
+            const metaCol = L.vwd && typeof L.vwd.metaCol === 'string' ? L.vwd.metaCol : '';
+            if (!fields || !metaCol || !fields.length) continue;
+            const byPath = new Map();
+            // 登记范围内的**所有**字段都参与说明检查，与它有没有生成 note 插槽无关：
+            // 初始没有说明、说明被通用规则过滤等没有插槽的字段，新说明无法呈现，
+            // 这时必须明确拒绝，不能静默丢弃后返回成功。
+            for (const field of fields) {
+                if (!field || typeof field !== 'object' || !field.id || !Array.isArray(field.path) || !field.path.length) continue;
+                byPath.set(field.path.map(String).join('\u0000'), field);
+            }
+            if (byPath.size) vwdSlots.push({ layout: L, metaCol, byPath });
+        }
+        // 说明变化只可能从 pair 叶子的第二项来；未提供说明不等于清除旧说明。
+        const vwdDescriptionAt = (node, path) => {
+            let cur = node;
+            for (const part of path) {
+                if (cur === null || cur === undefined || typeof cur !== 'object') return undefined;
+                cur = cur[part];
+            }
+            return Array.isArray(cur) && cur.length === 2 && typeof cur[1] === 'string' ? cur[1] : undefined;
+        };
+        // 与说明同一位置的当前值（pair 叶子取第一项；非 pair 一律视作未提供）。
+        const vwdValueAt = (node, path) => {
+            let cur = node;
+            for (const part of path) {
+                if (cur === null || cur === undefined || typeof cur !== 'object') return undefined;
+                cur = cur[part];
+            }
+            return Array.isArray(cur) && cur.length === 2 ? cur[0] : undefined;
+        };
+        const vwdEncode = (node, slot, fallback) => {
+            const overrides = {};
+            for (const [key, field] of slot.byPath) {
+                const path = key.split('\u0000');
+                const given = vwdDescriptionAt(node, path);
+                const desc = given === undefined && fallback ? vwdDescriptionAt(fallback, path) : given;
+                if (desc === undefined || desc === field.desc) continue;
+                overrides[field.id] = desc;
+            }
+            try { return JSON.stringify({ v: 1, o: overrides }); } catch (e) { return ''; }
+        };
+        // 每张变化表都须有匹配的动态渲染模板；不能用全局开关放行旧静态布局。
+        let vwdTables = persistedTables;
+        const vwdTablesForCheck = () => {
+            if (!vwdTables) vwdTables = api && typeof api.exportTableAsJson === 'function' ? api.exportTableAsJson() : null;
+            return vwdTables;
+        };
+        // 逐字段比较说明本身（不比较整份覆盖集合），只有真的出现说明差量才进入下面两步。
+        let vwdDescChanged = false;
+        for (const slot of vwdSlots) {
+            let slotDescChanged = false;
+            const nextDescs = {};
+            const prevDescs = {};
+            for (const [key, field] of slot.byPath) {
+                const path = key.split('\u0000');
+                const nd = vwdDescriptionAt(nextStat, path);
+                const pd = vwdDescriptionAt(prevStat, path);
+                if (nd !== undefined) nextDescs[field.id] = nd;
+                if (pd !== undefined) prevDescs[field.id] = pd;
+                // 只有“确实提供了一个字符串说明、且与原说明不同”才算说明变化：
+                // 字段被删除、值不是 [值, 说明] 形状时都不是说明差量，按原有语义处理。
+                if (nd !== undefined && nd !== pd) slotDescChanged = vwdDescChanged = true;
+            }
+            if (slotDescChanged && !vwdNoteSync(slot.layout, vwdTablesForCheck())) {
+                const code = slot.layout.vwd && slot.layout.vwd.hostSync ? 'hostSyncUnsupported' : 'descChangeUnsupported';
+                markWriteFailure('表「' + slot.layout.table + '」的动态说明变化未落库：' + code
+                    + '（缺少匹配的动态说明模板或 EJS 渲染能力）');
+                if (mvu2ledgerDebugOn()) {
+                    dbg('[VWD] ' + code + ' table=' + slot.layout.table
+                        + ' next=' + JSON.stringify(nextDescs) + ' prev=' + JSON.stringify(prevDescs));
+                }
+                return 0;
+            }
+        }
+        // 说明是否真的变化：比较“覆盖集合”而不是整份快照，未变化时不写元数据列。
+        const vwdMetaAfter = new Map();
+        if (vwdDescChanged) {
+            for (const slot of vwdSlots) {
+                const after = vwdEncode(nextStat, slot, prevStat);
+                if (!after) { markWriteFailure('VWD 说明覆盖集合无法序列化（表「' + slot.layout.table + '」）'); continue; }
+                if (after !== vwdEncode(prevStat, slot)) vwdMetaAfter.set(slot, after);
+            }
+        }
+        // MVU/VWD 的 message stat_data 里可能仍是 [值, 说明] 叶子。值路由必须按“值”走
+        // layout 明确登记的 pair 列，否则 TEXT 列会拿到 [值,说明] 的逗号拼接文本、数值/布尔
+        // 列会拿到整段数组。登记范围只由 layout 决定，与 VWD 实验开关无关：写库边界
+        // 必须把“当前值”交给宿主，这是编码契约，不是可选功能。
+        const pairPathTypes = new Map();
+        for (const L of entries) {
+            if (!L) continue;
+            const entryPrefix = L.kind === 'singleton' ? [L.group] : ((L.writePaths || [])[0] || [L.group]);
+            for (const c of (Array.isArray(L.cols) ? L.cols : [])) {
+                if (!Array.isArray(c)) continue;
+                // pair / jsonPairOptional 一定是 pair 列；number/boolean 列为 pair 叶子时
+                // columnLayoutType 会把它映射成普通标量，但布局仍保留 isPair 标记，
+                // 值也仍是 [值, 说明]，写库边界同样只能取当前值。
+                if (!pairColumnType(c)) continue;
+                const cp = Array.isArray(c[3]) && c[3].length ? c[3] : null;
+                if (!cp) continue;
+                if (L.kind === 'singleton') {
+                    pairPathTypes.set(pathKey(cp.map(String)), c[1]);
+                    continue;
+                }
+                // 行表：相对段接到每个 writePath 上，与 writer 解析出的单元格路径一致
+                // （如 关系.*.背包.*.效果.描述）。
+                const rel = cp[0] === entryPrefix[0] && cp.length >= entryPrefix.length ? cp.slice(entryPrefix.length) : cp;
+                for (const wp of (L.writePaths && L.writePaths.length ? L.writePaths : [entryPrefix])) {
+                    pairPathTypes.set(pathKey([...wp.map(String), '*', ...rel.map(String)]), c[1]);
+                }
+            }
+        }
+        // 叶子折叠（把 pair 折成值）只在 VWD 实验布局下启用：说明差量需要拿到未折叠的说明，
+        // 且 writer 要能区分“只改说明”。普通布局不折叶子，值仍按 pair 形状参与差异比较，
+        // 只在写库边界取出当前值（见下方 encoder），因此读回与旧行为一致。
+        const pairLeafFolding = vwdSlots.length > 0;
+        // 该单元格是否落在 layout 明确登记的 pair 列上：决定写库边界取“当前值”还是整段
+        // 编码。与 VWD 实验开关无关，只用 layout 声明判断，不按“任意二元素数组”猜测。
+        // op.np 相对该 entry 的逻辑路径：singleton 去掉组名，rows/nestedRows 去掉行键。
+        const valuesRelPath = (entry, np) => {
+            if (!entry || !Array.isArray(entry.prefix)) return null;
+            const parts = pathParts(np);
+            if (parts.length <= entry.prefix.length) return null;
+            return (entry.kind === 'rows' || entry.kind === 'nestedRows')
+                ? parts.slice(entry.prefix.length + 1)
+                : parts.slice(entry.prefix.length);
+        };
+        const declaredPairTypeOf = (entry, logicalPath) => {
+            if (!entry || !entry.layout || !Array.isArray(logicalPath)) return '';
+            if (entry.layout.kind === 'singleton') {
+                return pairPathTypes.get(pathKey([entry.layout.group, ...logicalPath.map(String)])) || '';
+            }
+            // 行表/关系行表：登记键里带行键通配段（R.*.好感），与读取端同一套路径。
+            const wp = (entry.layout.writePaths && entry.layout.writePaths[0]) || [entry.layout.group];
+            return pairPathTypes.get(pathKey([...wp.map(String), '*', ...logicalPath.map(String)])) || '';
+        };
+
+        const collapsePairLeaves = (stat) => {
+            if (!pairLeafFolding || !pairPathTypes.size || !stat || typeof stat !== 'object') return stat;
+            const out = JSON.parse(JSON.stringify(stat));
+            const collapseLeaf = (node, key) => {
+                const v = node[key];
+                if (Array.isArray(v) && v.length === 2 && typeof v[1] === 'string') node[key] = v[0];
+            };
+            const walkPath = (node, parts, pos) => {
+                if (!node || typeof node !== 'object') return;
+                const token = parts[pos];
+                if (pos === parts.length - 1) {
+                    if (token === '*') { for (const k of Object.keys(node)) collapseLeaf(node, k); }
+                    else collapseLeaf(node, token);
+                    return;
+                }
+                if (token === '*') {
+                    for (const k of Object.keys(node)) walkPath(node[k], parts, pos + 1);
+                    return;
+                }
+                walkPath(node[token], parts, pos + 1);
+            };
+            for (const pathStr of pairPathTypes.keys()) walkPath(out, JSON.parse(pathStr), 0);
+            return out;
+        };
+        let prevValueStat = null;
+        let nextValueStat = null;
+        const prevForValues = () => (prevValueStat || (prevValueStat = collapsePairLeaves(prevStat) || {}));
+        const nextForValues = () => (nextValueStat || (nextValueStat = collapsePairLeaves(nextStat) || {}));
+        // 字面路径段的序列化键 → 元数据写入内容。值路由会先把
+        // [值, 说明] 折叠成值，因此按路径匹配而不是按叶子形状识别，任何一条 push 分支
+        // 产生的单元格操作都能被正确附带说明。
+        const vwdMetaByPath = new Map();
+        const vwdPathOf = (layout, logicalPath) => {
+            const wp = (layout.writePaths && layout.writePaths[0]) || [layout.group];
+            return pathKey([...wp, ...logicalPath]);
+        };
+        for (const slot of vwdSlots) {
+            if (!vwdMetaAfter.has(slot)) continue;
+            for (const [, field] of slot.byPath) {
+                const cp = Array.isArray(field.path) && field.path.length ? field.path : [slot.layout.group, field.col];
+                const logical = cp[0] === slot.layout.group ? cp.slice(1) : cp;
+                vwdMetaByPath.set(vwdPathOf(slot.layout, logical), { col: slot.metaCol, value: vwdMetaAfter.get(slot), slot });
+            }
+        }
+        // 已随值单元格提交的 VWD 槽位：其余需要单独补一条元数据写入。
+        const vwdAttached = new Set();
+        const encodeJsonScalar = (value, type) => {
+            if (type === 'jsonPairOptional' && Array.isArray(value) && value.length === 2 && typeof value[1] === 'string') value = value[0];
+            if ((type === 'jsonScalarOptional' || type === 'jsonPairOptional')) {
+                if (value === undefined) return '';
+                if (value !== null && !['string', 'boolean', 'number'].includes(typeof value)
+                    || typeof value === 'number' && !Number.isFinite(value)) {
+                    markWriteFailure('nullable 标量列只接受字符串、有限数字、布尔、null 或缺失值');
+                    return '';
+                }
+            }
+            return JSON.stringify(value);
+        };
+        const validJsonContainer = (value, kind, seen = new Set()) => {
+            const plainObject = value => {
+                if (!value || Object.prototype.toString.call(value) !== '[object Object]') return false;
+                const proto = Object.getPrototypeOf(value);
+                return proto === null || Object.prototype.hasOwnProperty.call(proto, 'constructor')
+                    && Function.prototype.toString.call(proto.constructor) === Function.prototype.toString.call(Object);
+            };
+            if (kind === 'array' && value !== null && !Array.isArray(value)) return false;
+            if (kind === 'object' && value !== null && !plainObject(value)) return false;
+            if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+            if (typeof value === 'number') return Number.isFinite(value);
+            if (!value || typeof value !== 'object' || seen.has(value)) return false;
+            if (!Array.isArray(value) && !plainObject(value)) return false;
+            seen.add(value);
+            if (Array.isArray(value)) {
+                for (let i = 0; i < value.length; i++) if (!(i in value) || !validJsonContainer(value[i], undefined, seen)) return false;
+            } else for (const k of Object.keys(value)) if (!validJsonContainer(value[k], undefined, seen)) return false;
+            seen.delete(value);
+            return true;
+        };
+        const managedPaths = entry => {
+            const managed = (entry.layout.cols || []).map(c => {
+                let path = Array.isArray(c) ? (c[3] || []) : (c.path || []);
+                if (entry.kind === 'singleton' && path[0] === entry.layout.group) path = path.slice(1);
+                return path;
+            }).filter(path => Array.isArray(path) && path.length);
+            const owner = [...entry.prefix, ...(['rows', 'nestedRows'].includes(entry.kind) ? ['*'] : [])];
+            for (const child of entries) {
+                if (child === entry.layout) continue;
+                const paths = child.writePaths?.length ? child.writePaths : [child.path?.length ? child.path : [child.group]];
+                for (const path of paths) if (path.length > owner.length && owner.every((part, i) => part === '*' || path[i] === '*' || part === path[i])) managed.push(path.slice(owner.length));
+            }
+            return managed;
+        };
+        const pathPrefix = (short, long) => short.length <= long.length && short.every((part, i) => part === '*' || long[i] === '*' || part === long[i]);
+        const collect = (prevObj, nextObj, pathStr) => {
+            const keys = Object.keys(nextObj || {});
+            // 仅新 nullable 编码有“删除已建列叶子”的无损表示。父行/旧布局的删除
+            // 继续交给原有流程，不能因遍历 prevStat 就把整张行表当成空值更新。
+            for (const k of Object.keys(prevObj || {})) {
+                if (Object.prototype.hasOwnProperty.call(nextObj || {}, k)) continue;
+                const np = pathStr.concat(k);
+                const entry = tableEntryByPath(np);
+                if (!entry || !entry.prefix) continue;
+                let rel = pathParts(np).slice(entry.prefix.length);
+                if (entry.kind === 'rows' || entry.kind === 'nestedRows') rel = rel.slice(1);
+                const col = (entry.layout.cols || []).find(c => {
+                    if (c[1] !== 'jsonScalarOptional' && c[1] !== 'jsonPairOptional' && c[1] !== 'jsonObjectOptional') return false;
+                    let cp = c[3] || [];
+                    if (entry.kind === 'singleton' && cp[0] === entry.layout.group) cp = cp.slice(1);
+                    return cp.length === rel.length && cp.every((p, i) => p === rel[i]);
+                });
+                if (col) keys.push(k);
+            }
+            for (const k of keys) {
+                const np = pathStr.concat(k);
+                const nv = nextObj[k];
+                const pv = prevObj && Object.prototype.hasOwnProperty.call(prevObj, k) ? prevObj[k] : undefined;
+                const entry = tableEntryByPath(np);
+                if (entry && (entry.kind === 'array' || entry.kind === 'pathArray' || entry.kind === 'nestedArray')) {
+                    ops.push({ np, entry, value: nv, replace: true });
+                    continue;
+                }
+                if (entry && entry.kind === 'json') {
+                    if (entry.layout.scalarType === 'number' && (typeof nv !== 'number' || !Number.isFinite(nv))) {
+                        markWriteFailure('数值表「' + entry.layout.table + '」只接受有限数字');
+                        continue;
+                    }
+                    // JSON 组允许对象、数组和标量；数据形状不能证明调用来自默认值回写。
+                    // 统一接收实际变化，后续与数据库当前内容比较以跳过无变化的重复写入。
+                    ops.push({ np, entry, value: nv, json: true });
+                    continue;
+                }
+                if (entry && (entry.kind === 'singleton' || entry.kind === 'rows' || entry.kind === 'nestedRows')) {
+                    const rel = np.slice(entry.prefix.length);
+                    const fIdx = (entry.kind === 'rows' || entry.kind === 'nestedRows') ? 1 : 0;
+                    if (fIdx === 1 && rel.length === 1 && entry.layout.scalarValueCol) {
+                        const col = (entry.layout.cols || []).find(c => c[0] === entry.layout.scalarValueCol && c[1] === 'jsonObjectOptional');
+                        if (col) {
+                            if (nv !== undefined && !validJsonContainer(nv, col[7])) {
+                                markWriteFailure('整条可空记录只接受声明的对象/数组、null 或缺失值');
+                                continue;
+                            }
+                            ops.push({ np, entry, value: nv, prev: pv, jsonCell: true, col: col[0] });
+                            continue;
+                        }
+                    }
+                    if (entry.kind === 'singleton' && entry.layout.valueCol && rel.length === 0) {
+                        const col = (entry.layout.cols || []).find(c => c[0] === entry.layout.valueCol && c[1] === 'jsonObjectOptional');
+                        if (!col || nv !== undefined && !validJsonContainer(nv, col[7])) {
+                            markWriteFailure('整组可空容器只接受声明的对象/数组、null 或缺失值');
+                            continue;
+                        }
+                        ops.push({ np, entry, value: nv, prev: pv, jsonCell: true, col: col[0] });
+                        continue;
+                    }
+                    if (nv === null && (rel.length === 0 && (entry.kind === 'singleton' || entry.layout.emptyValue !== null)
+                        || fIdx === 1 && rel.length === 1 && !entry.layout.scalarValueCol)) {
+                        markWriteFailure('表「' + entry.layout.table + '」无法区分整组/整行 null；请使用字段级可空 JSON 列');
+                        continue;
+                    }
+                    if (rel.length > fIdx) {
+                        // 展平后的嵌套 JSON 列也必须在容器边界整块写入。例如动态行表的
+                        // 登神长阶.要素 对应列 path=[登神长阶,要素]。旧逻辑只按首段
+                        // `登神长阶` 找列，找不到后继续递归到对象叶子，最终新行的 JSON
+                        // 列保持空字符串并触发 json_valid CHECK。
+                        const logicalPath = rel.slice(fIdx);
+                        const exactColDef = (entry.layout.cols || []).find(c => {
+                            let cp = Array.isArray(c) ? (c[3] || []) : (c.path || []);
+                            if (entry.kind === 'singleton' && cp[0] === entry.layout.group) cp = cp.slice(1);
+                            return Array.isArray(cp) && cp.length === logicalPath.length && cp.every((p, i) => p === logicalPath[i]);
+                        });
+                        const exactColType = exactColDef && (Array.isArray(exactColDef) ? exactColDef[1] : exactColDef.type);
+                        if (exactColDef && nv === null && pv !== null && !/jsonScalar|jsonPair|jsonObjectOptional/.test(String(exactColType || ''))) {
+                            markWriteFailure('列「' + (exactColDef[0] || exactColDef.zh) + '」的现有布局无法无损存储 null；请按 nullable 声明重新转换并迁移模板');
+                            continue;
+                        }
+                        if (exactColDef && /object|json/i.test(String(exactColType || ''))) {
+                            ops.push({
+                                np,
+                                entry,
+                                value: nv,
+                                prev: pv,
+                                jsonCell: true,
+                                col: Array.isArray(exactColDef) ? exactColDef[0] : exactColDef.zh,
+                            });
+                            continue;
+                        }
+                        if (exactColDef && (nv === null || typeof nv !== 'object')) {
+                            ops.push({
+                                np,
+                                entry,
+                                value: nv,
+                                prev: pv,
+                                col: Array.isArray(exactColDef) ? exactColDef[0] : exactColDef.zh,
+                            });
+                            continue;
+                        }
+                        const fld = rel[fIdx];
+                        const declared = entry.layout.cols.some(c => c[0] === fld);
+                        if (!declared) {
+                            // Classify this exact source path using the final
+                            // layout, including delegated child-table prefixes.
+                            // Sharing a first segment is not ownership of every
+                            // sibling beneath that segment.
+                            const logicalPath = rel.slice(fIdx);
+                            const mapped = managedPaths(entry).some(path => pathPrefix(logicalPath, path));
+                            if (!mapped) {
+                                const echoCandidate = String(logicalPath[0]).charAt(0) === '_' && pv === undefined && isStructurallyDefault(nv);
+                                ops.push({ np, entry, value: nv, prev: pv, overflow: true, echoCandidate,
+                                    mergeKey: logicalPath[0], mergePath: logicalPath,
+                                    rowKey: ['rows', 'nestedRows'].includes(entry.kind) ? rel[0] : undefined,
+                                    parentKey: entry.kind === 'nestedRows' ? entry.prefix[entry.prefix.length - 2] : undefined });
+                                continue;
+                            }
+                        }
+                        // 声明为对象列（JSON 存储，如 系统._管理考核）：路径正好落在对象列上时，
+                        // 整对象一次性写入，不再向下递归到子字段（子字段没有独立列）。
+                        const colDef = entry.layout.cols.find(c => c[0] === fld);
+                        if (colDef && rel.length === fIdx + 1 && /object|json/i.test(String(colDef[1] || ''))) {
+                            ops.push({ np, entry, value: nv, prev: pv, jsonCell: true, col: fld });
+                            continue;
+                        }
+                    }
+                }
+                if (nv && typeof nv === 'object' && !Array.isArray(nv)) {
+                    if (entry && ['rows', 'nestedRows'].includes(entry.kind)
+                        && pathParts(np).length === entry.prefix.length + 1 && !entry.layout.scalarValueCol
+                        && pv === undefined) {
+                        // 新记录可能只有子表字段，仍需先登记本行身份，供后代关联。
+                        ops.push({ np, entry, kind: 'row-create' });
+                    }
+                    collect(pv && typeof pv === 'object' && !Array.isArray(pv) ? pv : {}, nv, np);
+                } else {
+                    // 该单元格落在 layout 明确登记的 pair 列时记下类型（含数字/布尔 pair：
+                    // columnLayoutType 会把它们映射为 number/boolean，登记键仍是 pair 路径）。
+                    const relPath = valuesRelPath(entry, np);
+                    const pairType = relPath ? declaredPairTypeOf(entry, relPath) : '';
+                    ops.push({ np, entry, value: nv, prev: pv, pairType });
+                }
+            }
+        };
+        collect(prevForValues(), nextForValues(), []);
+        // 说明差量按完整路径贴到对应单元格操作上：说明变了而值没变时也返回真，
+        // 阻止“值未变化 → 跳过写入”。
+        for (const op of ops) {
+            if (!op || op.kind || op.overflow || op.overflowRemove || op.replace || op.json) continue;
+            const hit = op.np && vwdMetaByPath.get(pathKey(op.np));
+            if (!hit) continue;
+            op.vwdMetaCol = hit.col;
+            op.vwdMetaValue = hit.value;
+            op.vwdSlot = hit.slot;
+            if (sameValue(op.value, op.prev)) vwdAttached.add(hit.slot);
+        }
+        // 行表删除检测：stat_data 中已不存在的行键 → 对应表行应删除（补齐 diff 路径的删除方向；
+        // 参考卡前端删除直接走 api.deleteRow，这里把 stat_data 删键翻译成删行）
+        for (const L of entries) {
+            if (L.kind !== 'rows') continue;
+            const wp = (L.writePaths || [])[0] || [L.group];
+            const dictAt = (obj) => {
+                let c = obj;
+                for (const p of wp) { if (c === null || c === undefined || typeof c !== 'object') return undefined; c = c[p]; }
+                return c;
+            };
+            const prevDict = dictAt(prevForValues());
+            const nextDict = dictAt(nextForValues());
+            if (!prevDict || typeof prevDict !== 'object' || Array.isArray(prevDict)) continue;
+            const nextObj = (nextDict && typeof nextDict === 'object' && !Array.isArray(nextDict)) ? nextDict : null;
+            const nextKeys = nextObj ? new Set(Object.keys(nextObj)) : new Set();
+            // 空组保护只在 target 完全没提供该组（nextObj 为 null，前端分批写）时生效：
+            // 此时组缺失≠删除意图，跳过扫描避免 DELETE-only 误删。
+            // 显式把组置空（nextObj 存在但无键，如前端点删除后整组变 {}）是明确的删除意图，必须执行删除。
+            if (nextDict === undefined && Object.keys(prevDict).length > 0 && nextKeys.size === 0) continue;
+            for (const k of Object.keys(prevDict)) {
+                if (!nextKeys.has(k)) {
+                    ops.push({ np: wp.concat([k]), entry: { layout: L, kind: 'rows', prefix: wp }, kind: 'row-delete', rowKey: k });
+                }
+            }
+        }
+        // 关系子表删除检测：每个父条目下的子键独立比对。
+        for (const L of entries) {
+            if (L.kind !== 'nestedRows') continue;
+            const pattern = (L.writePaths && L.writePaths[0]) || [...(L.parentPath || [L.group]), '*', L.childKey];
+            const walk = (prevNode, nextNode, pos, concrete, ancestors) => {
+                if (!prevNode || typeof prevNode !== 'object' || Array.isArray(prevNode)) return;
+                if (pos === pattern.length - 1) {
+                    const childName = pattern[pos];
+                    const prevChild = prevNode[childName];
+                    if (!prevChild || typeof prevChild !== 'object' || Array.isArray(prevChild)) return;
+                    if (nextNode === undefined) return; // 上级记录删除由上级表处理
+                    const nextChild = nextNode && typeof nextNode === 'object' ? nextNode[childName] : undefined;
+                    const nextKeys = nextChild && typeof nextChild === 'object' && !Array.isArray(nextChild) ? new Set(Object.keys(nextChild)) : new Set();
+                    const prefix = [...concrete, childName];
+                    for (const rowKey of Object.keys(prevChild)) {
+                        if (!nextKeys.has(rowKey)) ops.push({
+                            np: prefix.concat([rowKey]),
+                            entry: { layout: L, kind: 'nestedRows', prefix, ancestorValues: ancestors.slice() },
+                            kind: 'row-delete', rowKey, parentKey: ancestors[ancestors.length - 1], ancestorValues: ancestors.slice(),
+                        });
+                    }
+                    return;
+                }
+                const token = pattern[pos];
+                if (token === '*') {
+                    for (const key of Object.keys(prevNode)) walk(prevNode[key], nextNode && nextNode[key], pos + 1, [...concrete, key], [...ancestors, key]);
+                } else {
+                    walk(prevNode[token], nextNode && nextNode[token], pos + 1, [...concrete, token], ancestors);
+                }
+            };
+            walk(prevForValues(), nextForValues(), 0, [], []);
+        }
+        // 溢出字段删除检测：stat_data 中整个被移除的动态字段（未声明列/子表）要从对应行
+        // _扩展数据 里同步删除（只处理“第一层未声明字段”整个消失；字段仍在但子键减少时，
+        // 前端会整对象写回，由 overflow 写操作覆盖，无需在此处理）。
+        const detectOverflowRemovals = (prevObj, nextObj, pathStr) => {
+            if (!prevObj || typeof prevObj !== 'object' || Array.isArray(prevObj)) return;
+            for (const k of Object.keys(prevObj)) {
+                const nextHas = nextObj && typeof nextObj === 'object' && !Array.isArray(nextObj) && Object.prototype.hasOwnProperty.call(nextObj, k);
+                const np = pathStr.concat(k);
+                if (nextHas) {
+                    const pv = prevObj[k];
+                    const nv = nextObj[k];
+                    if (pv && typeof pv === 'object' && !Array.isArray(pv) && nv && typeof nv === 'object' && !Array.isArray(nv)) {
+                        detectOverflowRemovals(pv, nv, np);
+                    }
+                    continue;
+                }
+                const entry = tableEntryByPath(np);
+                if (!entry || !['singleton', 'rows', 'nestedRows'].includes(entry.kind)) continue;
+                const rel = np.slice(entry.prefix.length), rowTable = ['rows', 'nestedRows'].includes(entry.kind);
+                const logicalPath = rowTable ? rel.slice(1) : rel;
+                if (!logicalPath.length || managedPaths(entry).some(path => pathPrefix(logicalPath, path) || pathPrefix(path, logicalPath))) continue;
+                ops.push({
+                    np, entry,
+                    overflowRemove: true,
+                    mergeKey: logicalPath[0], mergePath: logicalPath,
+                    rowKey: rowTable ? rel[0] : undefined,
+                });
+            }
+        };
+        detectOverflowRemovals(prevForValues(), nextForValues(), []);
+
+        // 说明变化但没有对应值单元格的 VWD 字段（例如该 pair 说明在此次写入里完全没有
+        // 出现其它变化）：补一条只写内部元数据列的单元格操作。值列一并带上当前值，
+        // 不改变“值单元格是否变化”在调用层的可判定性。
+        for (const [slot, value] of vwdMetaAfter) {
+            if (vwdAttached.has(slot)) continue;
+            const wp = slot.layout.writePaths && slot.layout.writePaths[0];
+            const prefix = Array.isArray(wp) && wp.length ? wp : [slot.layout.group];
+            let current;
+            for (const [, field] of slot.byPath) {
+                const raw = vwdValueAt(nextStat, field.path);
+                if (raw !== undefined) { current = raw; break; }
+            }
+            ops.push({
+                np: prefix.slice(),
+                entry: { layout: slot.layout, kind: 'singleton', prefix },
+                value: current,
+                prev: current,
+                vwdMetaCol: slot.metaCol,
+                vwdMetaValue: value,
+                vwdOnly: true,
+            });
+        }
+
+        // 组级判定：`_` 前缀内部字段的“回声候选”仅在同表没有其他真实写入时才跳过。
+        // 前端真实操作（如成就领取：当前MC点 +PT 与 _hypnoos 同批写回）会带声明列/真实
+        // 变化 → 放行；渲染回声（只有 _hypnoos 全默认，其余声明列同值）→ 跳过不落库。
+        const echoCandidates = ops.filter(op => op && op.echoCandidate);
+        if (echoCandidates.length) {
+            const realTables = new Set();
+            for (const op of ops) {
+                if (!op || op.echoCandidate) continue;
+                const tbl = op.entry && op.entry.layout && op.entry.layout.table;
+                if (!tbl) continue;
+                // 声明列 cell（无 kind/json/overflow/replace 标记）：值类型等价时不产生写入，
+                // 不算真实变化（渲染回声的整组声明列都是同值，不能因此放行 _hypnoos）。
+                const isPlainCell = !op.kind && !op.json && !op.overflow && !op.replace;
+                if (isPlainCell && sameValue(op.value, op.prev)) continue;
+                realTables.add(tbl);
+            }
+            for (const op of ops) {
+                if (op && op.echoCandidate) {
+                    const tbl = op.entry && op.entry.layout && op.entry.layout.table;
+                    if (realTables.has(tbl)) {
+                        delete op.echoCandidate;
+                    } else {
+                        dbg(' [渲染回写抑制] 组级判定：' + op.np + ' 是同表唯一全默认内部状态回声，跳过不落库。');
+                    }
+                }
+            }
+            // echoCandidate 已清除的保留；其余回声候选被过滤掉
+            const keptOps = ops.filter(op => !(op && op.echoCandidate));
+            ops.length = 0;
+            for (const kept of keptOps) ops.push(kept);
+        }
+
+        // 单例/整组JSON表若缺初始行（插件可能只保留表头+seedRows，未物化到 content），先按模板补行，
+        // 避免 updateCell: Row index 1 out of bounds 导致写入落空
+        const seedNeeded = {};
+        for (const op of ops) {
+            if (op && op.entry && op.entry.layout && (op.entry.kind === 'singleton' || op.entry.kind === 'json')) {
+                // 只对真正有变化的操作补行：值未变化的 op 不会产生写入，也不需要物化初始行
+                if (op.overflow || op.json || op.value !== op.prev) {
+                    seedNeeded[op.entry.layout.table] = op.entry;
+                }
+            }
+        }
+        if (Object.keys(seedNeeded).length) {
+            let tplSrc = null;
+            try { tplSrc = await Promise.resolve(api.getTableTemplate({ scope: 'chat' })) || null; } catch (e) { tplSrc = null; }
+            // 插件拿不到模板时，退回扩展启动时缓存的卡内模板（__SL_MVU_TEMPLATE_DATA__）
+            if (!tplSrc) {
+                try {
+                    tplSrc = readCachedTemplate() || null;
+                } catch (e) {}
+            }
+            for (const tableName in seedNeeded) {
+                if (abortWrites) break;
+                const SE = seedNeeded[tableName];
+                const SE0 = SE.layout || SE;
+                const found2 = sheetOf(SE0.table);
+                if (!found2 || !Array.isArray(found2.sheet.content) || found2.sheet.content.length > 1) continue;
+                // 持久化帧里该表已有数据行（checkpoint/content 非空）→ 运行时仅表头只是插件
+                // 回放未完成。此时补行会造出重复/错位行（row_id 对不上重放），触发插件的
+                // “手动追平持久化完整性校验失败：V2 replay 与本轮已提交数据不一致”。
+                // 跳过补行：updateCell 越界 → 合并层延迟重试，等回放完成后直接写。
+                if (persistedTables && typeof persistedTables === 'object') {
+                    const pSheet = Object.values(persistedTables).find(s => s && s.name === SE0.table);
+                    if (pSheet && Array.isArray(pSheet.content) && pSheet.content.length > 1) continue;
+                }
+                // 初始行对象：布局列默认值兜底（布局一定在，且默认值=卡模板初始行），
+                // 再叠加模板（若拿得到）里的值。之前只依赖 getTableTemplate/模板缓存，
+                // 首楼替换窗口里两者都可能缺失 → sObj={} → INSERT 依赖列 DEFAULT，
+                // 某些表/时刻会失败且返回值被忽略 → updateCell 全部越界 → 注入部分丢失。
+                let sObj = {};
+                const layoutCols = Array.isArray(SE0.cols) ? SE0.cols : [];
+                for (const c of layoutCols) {
+                    const colZh = Array.isArray(c) ? c[0] : (c && c.zh);
+                    if (!colZh || colZh === '_扩展数据') continue;
+                    const fb = Array.isArray(c) ? c[2] : c.fallback;
+                    const type = Array.isArray(c) ? c[1] : c.type;
+                    if (((type === 'jsonScalarOptional' || type === 'jsonPairOptional') || type === 'jsonObjectOptional') && c[6] === true) continue;
+                    sObj[colZh] = (type === 'jsonScalarOptional' || type === 'jsonPairOptional') ? (fb === undefined ? '' : JSON.stringify(fb))
+                        : type === 'jsonObjectOptional' ? (fb === undefined ? '' : (typeof fb === 'string' ? fb : JSON.stringify(fb)))
+                        : (fb === undefined || fb === null) ? '' : fb;
+                }
+                if (tplSrc && typeof tplSrc === 'object') {
+                    for (const k in tplSrc) {
+                        if (k.indexOf('sheet_') === 0 && tplSrc[k] && tplSrc[k].name === SE0.table) {
+                            const s = tplSrc[k];
+                            const hdr = Array.isArray(s.content) && Array.isArray(s.content[0]) ? s.content[0] : [];
+                            const row = Array.isArray(s.content) && s.content[1] ? s.content[1] : [];
+                            for (let i = 1; i < hdr.length; i++) sObj[hdr[i]] = (row[i] !== undefined && row[i] !== null) ? row[i] : '';
+                            break;
+                        }
+                    }
+                }
+                if (SE.kind === 'json') {
+                    // 整组 JSON 表：身份行 + 内容列必须是合法 JSON（模板行可能为空串，
+                    // 插件 SQLite 表带 CHECK json_valid(neirong)，空串/非 JSON 会被拒绝）
+                    if (SE0.keyCol && !sObj[SE0.keyCol]) sObj[SE0.keyCol] = SE0.keyValue || 'row1';
+                    const jv0 = sObj['内容'];
+                    if (SE0.scalarType === 'number') {
+                        const fallback = ((SE0.cols || [])[0] || [])[2] ?? 0;
+                        sObj['内容'] = jv0 !== '' && jv0 !== null && jv0 !== undefined && Number.isFinite(Number(jv0)) ? Number(jv0) : fallback;
+                    }
+                    else if (jv0 === undefined || jv0 === null || jv0 === '') sObj['内容'] = '{}';
+                    else { try { JSON.parse(jv0); } catch (e) { sObj['内容'] = '{}'; } }
+                }
+                try {
+                    const ir = await Promise.resolve(api.insertRow(SE0.table, sObj));
+                    if (ir === -1 || ir === false || ir === undefined || ir === null) {
+                        markWriteFailure('补初始行 insertRow(' + SE0.table + ')');
+                        dbgWarn(' 补初始行失败：insertRow(' + SE0.table + ') 返回 ' + String(ir) + '（原表仅表头）。');
+                    } else {
+                        dbg(' 已为表「' + SE0.table + '」补初始行（原表仅表头）。');
+                    }
+                } catch (e) {
+                    markWriteFailure('补初始行 insertRow(' + SE0.table + ')', e);
+                    dbgWarn(' 补初始行失败:', e);
+                }
+            }
+            try { tables = api.exportTableAsJson() || {}; } catch (e) {}
+        }
+
+        // 解析差异操作并跳过值未变化的写入
+        const resolved = [];
+        const directOps = [];
+        const newRows = new Map();
+        const parseObj = (v) => safeParseJson(v);
+        const setNestedValue = (obj, path, value) => {
+            const parts = Array.isArray(path) && path.length ? path : [];
+            if (!parts.length) return obj;
+            let cur = obj;
+            for (let i = 0; i < parts.length - 1; i++) {
+                if (!Object.prototype.hasOwnProperty.call(cur, parts[i]) || !cur[parts[i]] || typeof cur[parts[i]] !== 'object' || Array.isArray(cur[parts[i]])) {
+                    Object.defineProperty(cur, parts[i], { value: {}, enumerable: true, writable: true, configurable: true });
+                }
+                cur = cur[parts[i]];
+            }
+            Object.defineProperty(cur, parts[parts.length - 1], { value, enumerable: true, writable: true, configurable: true });
+            return obj;
+        };
+        for (const op of ops) {
+            const E = op.entry;
+            if (!E) continue;
+            const L = E.layout;
+            const found = sheetOf(L.table);
+            if (!found) continue;
+            const sheet = found.sheet;
+            const header = sheet.content && sheet.content[0] ? sheet.content[0] : [];
+            // 未变化的默认投影不应写进尚未物化的单例表；只有真实变化才补行。
+            if (E.kind === 'singleton' && sheet.content.length <= 1 &&
+                !op.overflow && !op.overflowRemove && !op.json && sameValue(op.value, op.prev)) continue;
+            const ancestorValues = E.kind === 'nestedRows'
+                ? ((Array.isArray(E.ancestorValues) && E.ancestorValues.length) ? E.ancestorValues
+                    : (Array.isArray(op.ancestorValues) && op.ancestorValues.length) ? op.ancestorValues
+                    : [op.parentKey])
+                : [];
+            if (op.kind === 'row-delete' && (E.kind === 'rows' || E.kind === 'nestedRows')) {
+                const rowIndex = E.kind === 'nestedRows'
+                    ? findRelationRowByAncestors(sheet, L, ancestorValues, op.rowKey)
+                    : findRowByColumn(sheet, L.keyCol, op.rowKey);
+                if (rowIndex !== -1) {
+                    resolved.push({ kind: 'row-delete', key: found.key, sheet, header, layout: L, rowIndex });
+                } else {
+                    // 行可能只在 seedRows（未物化）：从当前运行时 seedRows 移除（尽力；插件可能从模板 scope 补回）
+                    const ki = header.indexOf(L.keyCol);
+                    const before = Array.isArray(sheet.seedRows) ? sheet.seedRows.length : 0;
+                    if (Array.isArray(sheet.seedRows) && ki >= 0) {
+                        sheet.seedRows = sheet.seedRows.filter(r => !(Array.isArray(r) && String(r[ki]) === String(op.rowKey)));
+                    }
+                    if (Array.isArray(sheet.seedRows) && sheet.seedRows.length !== before) {
+                        dbg(' 行表「' + L.table + '」seedRows 已移除键「' + op.rowKey + '」（diff 路径）');
+                    } else {
+                        dbg(' 行表「' + L.table + '」键「' + op.rowKey + '」既不在 content 也不在 seedRows，跳过删除。');
+                    }
+                }
+                continue;
+            }
+            if (op.json && E.kind === 'json') {
+                const jcIdx = header.indexOf('内容');
+                if (jcIdx === -1) {
+                    dbgWarn(' 整组JSON表「' + L.table + '」缺少「内容」列（旧模板/旧聊天），写入已跳过；请重新转换角色卡并新开聊天。');
+                    continue;
+                }
+                const jNew = L.scalarType === 'number' ? op.value : (op.value === undefined ? '{}' : JSON.stringify(op.value));
+                const jCur = sheet.content[1] ? sheet.content[1][jcIdx] : undefined;
+                if (sameValue(jCur, jNew)) continue;
+                directOps.push({ kind: 'json', key: found.key, sheet, header, layout: L, value: jNew });
+                continue;
+            }
+            if (op.overflowRemove) {
+                const ovcIdx = header.indexOf(L.overflowCol || '_扩展数据');
+                if (ovcIdx === -1) continue;
+                let ovRow = 1;
+                if (E.kind === 'rows' || E.kind === 'nestedRows') {
+                    const ovKey = op.rowKey;
+                    if (ovKey === undefined) continue;
+                    ovRow = E.kind === 'nestedRows'
+                        ? findRelationRowByAncestors(sheet, L, ancestorValues, ovKey)
+                        : findRowByColumn(sheet, L.keyCol, ovKey);
+                    if (ovRow === -1) continue; // 行已不存在，无需清理
+                }
+                // 删除在运行时读取当前单元格再执行，避免覆盖同批次的溢出写入（见 runDirectOps）
+                directOps.push({ kind: 'overflow-remove', key: found.key, sheet, header, layout: L, rowIndex: ovRow, rowKey: op.rowKey, ancestorValues, removeKey: op.mergeKey, mergePath: op.mergePath });
+                continue;
+            }
+            if (op.overflow) {
+                const ovcIdx = header.indexOf(L.overflowCol || '_扩展数据');
+                if (ovcIdx === -1) {
+                    dbgWarn(' 表「' + L.table + '」缺少「_扩展数据」列（旧模板/旧聊天），动态字段写入已跳过；请重新转换角色卡并新开聊天。');
+                    continue;
+                }
+                let ovRow = 1;
+                if (E.kind === 'rows' || E.kind === 'nestedRows') {
+                    const ovKey = op.rowKey;
+                    if (ovKey === undefined) continue;
+                    ovRow = E.kind === 'nestedRows'
+                        ? findRelationRowByAncestors(sheet, L, ancestorValues, ovKey)
+                        : findRowByColumn(sheet, L.keyCol, ovKey);
+                    if (ovRow === -1) {
+                        // 行可能只存在于 seedRows：跳过，避免 INSERT 撞 UNIQUE
+                        const srH2 = header;
+                        const srF2 = Array.isArray(sheet.seedRows) && sheet.seedRows.length
+                            ? findRowByColumn({ content: [srH2, ...sheet.seedRows] }, L.keyCol, ovKey)
+                            : -1;
+                        if (srF2 !== -1) {
+                            dbg(' 表「' + L.table + '」键「' + ovKey + '」存在于 seedRows，溢出字段跳过（等待插件物化）。');
+                            continue;
+                        }
+                        // 合并进同一新行（与已声明字段同一条 INSERT，避免重复 INSERT 撞 UNIQUE）
+                        const nk2 = E.kind === 'nestedRows'
+                            ? L.table + '\u0000' + ancestorValues.map(v => String(v == null ? '' : v)).join('\u0000') + '\u0000' + ovKey
+                            : L.table + '\u0000' + ovKey;
+                        let nr2 = newRows.get(nk2);
+                        if (!nr2) { nr2 = { table: L.table, header, layout: L, keyCol: L.keyCol, keyVal: ovKey, ancestorKeyCols: E.kind === 'nestedRows' ? (L.ancestorKeyCols || [L.parentKeyCol]) : [], ancestorValues, cells: {} }; newRows.set(nk2, nr2); }
+                        const ovObj = {};
+                        setNestedValue(ovObj, op.mergePath || [op.mergeKey], op.value);
+                        const ovCell = JSON.stringify(ovObj);
+                        const prevOv = nr2.cells[L.overflowCol || '_扩展数据'];
+                        if (prevOv) {
+                            try { const m = JSON.parse(prevOv); setNestedValue(m, op.mergePath || [op.mergeKey], op.value); nr2.cells[L.overflowCol || '_扩展数据'] = JSON.stringify(m); } catch (e) { nr2.cells[L.overflowCol || '_扩展数据'] = ovCell; }
+                        } else {
+                            nr2.cells[L.overflowCol || '_扩展数据'] = ovCell;
+                        }
+                        continue;
+                    }
+                }
+                const ovCur = parseObj(sheet.content[ovRow] ? sheet.content[ovRow][ovcIdx] : undefined);
+                const ovMerged = JSON.parse(JSON.stringify(ovCur || {}));
+                setNestedValue(ovMerged, op.mergePath || [op.mergeKey], op.value);
+                const ovStr = JSON.stringify(ovMerged);
+                if (sameValue(sheet.content[ovRow] ? sheet.content[ovRow][ovcIdx] : undefined, ovStr)) continue;
+                // 运行时再读当前单元格合并写入（同批次可能有删除操作，见 runDirectOps）
+                directOps.push({ kind: 'overflow', key: found.key, sheet, header, layout: L, rowIndex: ovRow, rowKey: op.rowKey, ancestorValues, mergeKey: op.mergeKey, mergePath: op.mergePath || [op.mergeKey], value: op.value });
+                continue;
+            }
+            if (op.replace && (E.kind === 'array' || E.kind === 'pathArray' || E.kind === 'nestedArray')) {
+                const arr = Array.isArray(op.value) ? op.value : [];
+                const valueIdx = header.indexOf(L.valueCol || (header[1] || '内容'));
+                const parentIdx = E.kind === 'nestedArray' ? header.indexOf(L.parentKeyCol) : -1;
+                const parentVal = E.kind === 'nestedArray' ? E.prefix[1] : undefined;
+                const oldRows = sheet.content.slice(1).filter(r => E.kind !== 'nestedArray' || (r && parentIdx >= 0 && String(r[parentIdx]) === String(parentVal)));
+                const oldVals = oldRows.map(r => (r && valueIdx >= 0 ? r[valueIdx] : undefined));
+                const valueDef = (L.cols || []).find(c => c[0] === (L.valueCol || (header[1] || '内容')));
+                const isJsonScalarArray = valueDef && valueDef[1] === 'jsonScalar';
+                const encodeArrayValue = (v) => {
+                    if (!isJsonScalarArray) return v;
+                    try { const encoded = JSON.stringify(v); return encoded === undefined ? 'null' : encoded; } catch (e) { return 'null'; }
+                };
+                const unchanged = oldVals.length === arr.length && oldVals.every((v, i) => sameValue(v, encodeArrayValue(arr[i])));
+                if (unchanged) continue;
+                resolved.push({ kind: E.kind === 'nestedArray' ? 'nested-array' : 'array', key: found.key, sheet, header, layout: L, arr, parentIdx, parentVal, valueIdx, isJsonScalarArray });
+                continue;
+            }
+            const parts = pathParts(op.np);
+            let rowIndex = -1;
+            let newRowArr = null;
+            let newRowObj = null;
+            if (E.kind === 'singleton') {
+                // 显式定位 row_id=1（模板单例行）：垫脚行等其他 row_id 的行不应成为写入目标，
+                // 否则数据会落在垫脚行上、随后被去重删掉
+                rowIndex = 1;
+                for (let ri = 1; ri < sheet.content.length; ri++) {
+                    const r = sheet.content[ri];
+                    if (r && String(r[0]) === '1') { rowIndex = ri; break; }
+                }
+            } else if (E.kind === 'rows' || E.kind === 'nestedRows') {
+                const keyVal = parts[E.prefix.length];
+                if (keyVal === undefined) continue;
+                rowIndex = E.kind === 'nestedRows'
+                    ? findRelationRowByAncestors(sheet, L, ancestorValues, keyVal)
+                    : findRowByColumn(sheet, L.keyCol, keyVal);
+                if (rowIndex === -1) {
+                    // 行不在 content：直接 INSERT（含 seedRows 里的模板行——插件 seed 物化
+                    // 会按业务键去重，不会重复；快照兜底已删，跳过 = 永远落不了库）
+                    // 同一新行的多个字段合并为一条 INSERT，避免重复 INSERT 撞 UNIQUE
+                    // collect 阶段已按完整逻辑路径解析出的列名优先级最高；不能再用路径
+                    // 末段覆盖。否则同时存在「要素」与「登神长阶_要素」时会误写前者。
+                    let colZh = op.col || parts[parts.length - 1];
+                    if (L.scalarValueCol && parts.length === E.prefix.length + 1) {
+                        // 标量条目（如 修仙秘闻 的 {标题: 内容}）：值落在「描述/数值」列，
+                        // 而不是把条目键当成列名。
+                        colZh = L.scalarValueCol;
+                    } else if (header.indexOf(colZh) === -1) {
+                        // 展平容器路径（如 主角.炼丹.熟练度 → 炼丹熟练度 列）
+                        for (const c of (L.cols || [])) {
+                            const cp = Array.isArray(c) ? (c[3] || []) : (c.path || []);
+                            const logicalParts = E.kind === 'rows' ? parts.slice(E.prefix.length + 1) : parts;
+                            if (Array.isArray(cp) && cp.length === logicalParts.length && cp.every((p, i) => p === logicalParts[i])) {
+                                colZh = Array.isArray(c) ? c[0] : (c.zh);
+                                break;
+                            }
+                        }
+                    }
+                    const nk = E.kind === 'nestedRows'
+                        ? L.table + '\u0000' + ancestorValues.map(v => String(v == null ? '' : v)).join('\u0000') + '\u0000' + keyVal
+                        : L.table + '\u0000' + keyVal;
+                    let nr = newRows.get(nk);
+                    if (!nr) { nr = { table: L.table, header, layout: L, keyCol: L.keyCol, keyVal, ancestorKeyCols: E.kind === 'nestedRows' ? (L.ancestorKeyCols || [L.parentKeyCol]) : [], ancestorValues, cells: {} }; newRows.set(nk, nr); }
+                    if (op.kind === 'row-create') continue;
+                    // 对象列（JSON 存储，如 宗门.资源/建筑）：新行合并时整对象 JSON 序列化，
+                    // 否则 String(对象) 会落成 '[object Object]'（旧行更新有 jsonCell 处理，
+                    // 新行合并路径此前漏了）。
+                    const colDefN = (L.cols || []).find(c => c[0] === colZh);
+                    const colTypeN = colDefN ? String(Array.isArray(colDefN) ? colDefN[1] : (colDefN.type || '')) : '';
+                    const objColN = /object|jsonObjectOptional/i.test(colTypeN);
+                    if (colTypeN === 'jsonObjectOptional') {
+                        if (op.value === undefined) nr.cells[colZh] = '';
+                        else if (validJsonContainer(op.value, Array.isArray(colDefN) ? colDefN[7] : colDefN.jsonKind)) {
+                            try { nr.cells[colZh] = JSON.stringify(op.value); } catch (e) { markWriteFailure('可空 JSON 容器必须可序列化', e); }
+                        } else markWriteFailure('可空 JSON 容器只接受对象、数组、null 或缺失值');
+                    } else nr.cells[colZh] = /jsonScalar|jsonPair/i.test(colTypeN)
+                        ? encodeJsonScalar(op.value, colTypeN)
+                        : ((objColN && op.value && typeof op.value === 'object') ? JSON.stringify(op.value) : op.value);
+                    continue;
+                }
+            }
+            if (op.kind === 'row-create') continue; // 已存在身份行时不修改单元格。
+            if (rowIndex < 0 && !newRowArr) continue;
+            let colZh = op.col || parts[parts.length - 1];
+            let colIdx = header.indexOf(colZh);
+            if (L.scalarValueCol && parts.length === E.prefix.length + 1) {
+                // 标量条目（如 修仙秘闻 的 {标题: 内容}）：值落在「描述/数值」列，
+                // 而不是把条目键当成列名。
+                colZh = L.scalarValueCol;
+                colIdx = header.indexOf(colZh);
+            }
+            if (colIdx === -1) {
+                // 展平容器路径（如 主角.炼丹.熟练度 → 炼丹熟练度 列）
+                for (const c of (L.cols || [])) {
+                    const cp = Array.isArray(c) ? (c[3] || []) : (c.path || []);
+                    const logicalParts = E.kind === 'rows' ? parts.slice(E.prefix.length + 1) : parts;
+                    if (Array.isArray(cp) && cp.length === logicalParts.length && cp.every((p, i) => p === logicalParts[i])) {
+                        colZh = Array.isArray(c) ? c[0] : (c.zh);
+                        colIdx = header.indexOf(colZh);
+                        break;
+                    }
+                }
+            }
+            if (colIdx === -1) continue;
+            const targetColDef = (L.cols || []).find(c => (Array.isArray(c) ? c[0] : c.zh) === colZh);
+            const targetColType = targetColDef ? String(Array.isArray(targetColDef) ? targetColDef[1] : (targetColDef.type || '')) : '';
+            // VWD：一次算出该单元格的最终值。值没变但说明变了 → 改写成“只写内部元数据
+            // 列”（值列保持原样）；两者都变 → 元数据列挂到值单元格上，由执行阶段的同一次
+            // updateRow 提交。说明没变时行为与原来完全一致。
+            let cellValue;
+            if (/jsonScalar|jsonPair/i.test(targetColType)) {
+                cellValue = encodeJsonScalar(op.value, targetColType);
+            } else if (op.jsonCell) {
+                // 对象列：整对象 JSON 序列化后写入（脚本对 系统._管理考核 这类嵌套状态整体读写）
+                if (targetColType === 'jsonObjectOptional') {
+                    if (op.value === undefined) cellValue = '';
+                    else if (validJsonContainer(op.value, Array.isArray(targetColDef) ? targetColDef[7] : targetColDef.jsonKind)) {
+                        try { cellValue = JSON.stringify(op.value); } catch (e) { markWriteFailure('可空 JSON 容器必须是可序列化对象、数组、null 或缺失值', e); continue; }
+                    } else { markWriteFailure('可空 JSON 容器只接受对象、数组、null 或缺失值'); continue; }
+                } else {
+                    cellValue = JSON.stringify(op.value === undefined || op.value === null ? {} : op.value);
+                }
+            } else {
+                cellValue = op.value;
+            }
+            const curCell = newRowArr ? undefined : (sheet.content[rowIndex] ? sheet.content[rowIndex][colIdx] : undefined);
+            if (!newRowArr && sameValue(curCell, cellValue)) {
+                if (!op.vwdMetaCol) continue;
+                const metaIdx = header.indexOf(op.vwdMetaCol);
+                if (metaIdx === -1) {
+                    dbgWarn(' 表「' + L.table + '」缺少内部说明元数据列「' + op.vwdMetaCol + '」，动态说明写入已跳过（旧模板/旧聊天）。');
+                    continue;
+                }
+                if (sameValue(sheet.content[rowIndex] ? sheet.content[rowIndex][metaIdx] : undefined, op.vwdMetaValue)) continue;
+                resolved.push({
+                    kind: 'cell', key: found.key, sheet, header, layout: L, rowIndex,
+                    colIdx: metaIdx, colZh: op.vwdMetaCol, value: op.vwdMetaValue, vwdMeta: true,
+                });
+                continue;
+            }
+            const cell = { kind: 'cell', key: found.key, sheet, header, layout: L, rowIndex, colIdx, colZh, value: cellValue, newRowArr, newRowObj };
+            if (op.vwdMetaCol && !newRowArr) {
+                const metaIdx = header.indexOf(op.vwdMetaCol);
+                if (metaIdx === -1) dbgWarn(' 表「' + L.table + '」缺少内部说明元数据列「' + op.vwdMetaCol + '」，动态说明写入已跳过（旧模板/旧聊天）。');
+                else { cell.vwdMetaCol = op.vwdMetaCol; cell.vwdMetaValue = op.vwdMetaValue; cell.vwdMeta = true; }
+            }
+            cell.pairType = op.pairType || '';
+            resolved.push(cell);
+        }
+        // 把合并后的新行转换成单个 resolved 条目（批量 SQL 一条 INSERT / 回退路径一次 insertRow）
+        for (const nr of newRows.values()) {
+            const arr = new Array(nr.header.length).fill('');
+            const obj = {};
+            // INSERT 若只涉及部分字段，其他 JSON 列也不能留成空字符串；DDL 的
+            // json_valid/json_type CHECK 会在整行写入时检查所有列。按布局默认值补齐，
+            // 对象通常为 {}，数组通常为 []。
+            for (const c of (nr.layout.cols || [])) {
+                const colZh = Array.isArray(c) ? c[0] : c.zh;
+                const colType = Array.isArray(c) ? c[1] : c.type;
+                if (!colZh || Object.prototype.hasOwnProperty.call(nr.cells, colZh)) continue;
+                if (colType === 'jsonObjectOptional') {
+                    nr.cells[colZh] = ''; // 未提供的可缺失字段不能复制模板中另一条记录的初始值
+                    continue;
+                }
+                if (!/object/i.test(String(colType || ''))) continue;
+                let fallback = Array.isArray(c) ? c[2] : c.fallback;
+                if (typeof fallback !== 'string' || !/^\s*[\[{]/.test(fallback)) fallback = '{}';
+                nr.cells[colZh] = fallback;
+            }
+            for (const colZh of Object.keys(nr.cells)) {
+                const cIdx = nr.header.indexOf(colZh);
+                if (cIdx >= 0) { arr[cIdx] = String(nr.cells[colZh]); obj[colZh] = nr.cells[colZh]; }
+            }
+            const ki = nr.header.indexOf(nr.keyCol);
+            if (ki >= 0) { arr[ki] = String(nr.keyVal); obj[nr.keyCol] = String(nr.keyVal); }
+            (nr.ancestorKeyCols || []).forEach((col, ai) => {
+                const pi = nr.header.indexOf(col);
+                if (pi >= 0) { arr[pi] = String((nr.ancestorValues || [])[ai] == null ? '' : nr.ancestorValues[ai]); obj[col] = arr[pi]; }
+            });
+            resolved.push({ kind: 'cell', key: nr.table, sheet: null, header: nr.header, layout: nr.layout, rowIndex: -1, colIdx: -1, colZh: '', value: undefined, newRowArr: arr, newRowObj: obj });
+        }
+        // SP 没有物理外键。只传播本次明确删除的父行，不能因省略整组或发现历史
+        // 孤儿就清表。完整祖先键定位后代，同名条目不会串到其他父记录。
+        const childrenByParent = new Map(), childIndexes = new Map();
+        for (const child of entries) {
+            if (!['nestedRows', 'nestedArray'].includes(child.kind) || !child.parentTable) continue;
+            const list = childrenByParent.get(child.parentTable) || [];
+            list.push(child); childrenByParent.set(child.parentTable, list);
+        }
+        const deletions = resolved.filter(r => r.kind === 'row-delete');
+        const deletionKeys = new Set(deletions.map(r => JSON.stringify([r.key, r.rowIndex])));
+        for (let qi = 0; qi < deletions.length; qi++) {
+            const parent = deletions[qi], parentCols = [...(parent.layout.ancestorKeyCols || []), parent.layout.keyCol];
+            const pi = parentCols.map(col => parent.header.indexOf(col));
+            if (pi.some(i => i < 0) || !parent.sheet.content[parent.rowIndex]) continue;
+            const tuple = JSON.stringify(pi.map(i => String(parent.sheet.content[parent.rowIndex][i])));
+            for (const child of childrenByParent.get(parent.layout.table) || []) {
+                if (!childIndexes.has(child)) {
+                    const found = sheetOf(child.table), cols = child.ancestorKeyCols?.length ? child.ancestorKeyCols : [child.parentKeyCol];
+                    const header = found?.sheet?.content?.[0] || [], indices = cols.map(col => header.indexOf(col));
+                    const rows = new Map();
+                    if (found && cols.length === parentCols.length && indices.every(i => i >= 0)) {
+                        for (let ri = 1; ri < found.sheet.content.length; ri++) {
+                            const row = found.sheet.content[ri]; if (!row) continue;
+                            const key = JSON.stringify(indices.map(i => String(row[i]))), list = rows.get(key) || [];
+                            list.push(ri); rows.set(key, list);
+                        }
+                    }
+                    childIndexes.set(child, { found, header, rows });
+                }
+                const { found, header, rows } = childIndexes.get(child);
+                for (const rowIndex of rows.get(tuple) || []) {
+                    const key = JSON.stringify([found.key, rowIndex]);
+                    if (deletionKeys.has(key)) continue;
+                    deletionKeys.add(key);
+                    const op = { kind: 'row-delete', key: found.key, sheet: found.sheet, header, layout: child, rowIndex };
+                    resolved.push(op); deletions.push(op);
+                }
+            }
+        }
+        if (resolved.length === 0 && directOps.length === 0) return 0;
+
+        /* ---------------- 写库边界编码（值语义 → 物理单元格） ----------------
+         * 宿主单元格只接受字符串/数字：SP SyncBridge 对其它类型调用 .replace 会直接
+         * 抛错（SQLite hydrate 报 val.replace is not a function 并回退 native）。
+         * 旧式 pair 叶子的第二项是说明，不是数据；值列必须只拿到“当前值”。
+         * 这里按 layout 明确登记的列类型编码，不按“任意二元素数组”猜测：
+         *  - pair / jsonPairOptional：取第一项作为当前值（缺失回退列声明默认值）；
+         *  - 其余列：数组/对象序列化为 JSON 文本，字符串/数字/布尔原样保留。
+         */
+        const boundaryEncode = (value, pairType, colType, fallback) => {
+            // 数字/布尔 pair 的读回已经是标量；SQLite 物理单元格又可能返回 "0"/"1"。
+            // 对登记的布尔 pair 同样先编码，避免 false 与 "0" 被重复判成变化。
+            if (pairType && colType === 'boolean' && typeof value === 'boolean') return value ? 1 : 0;
+            // 声明为 pair 的列：布局类型可能是 number/boolean（该列被映射为普通标量），
+            // 但值仍是 [当前值, 说明]。此时只取当前值，并按该列真实的物理类型编码
+            // （jsonPairOptional 走 JSON 标量，数字/布尔/文本按物理列类型处理）。
+            if (pairType && Array.isArray(value) && value.length === 2 && typeof value[1] === 'string') {
+                // JSON 可空标量必须先处理 null/缺失，不能套用普通列默认值。
+                if (colType === 'jsonPairOptional') return encodeJsonScalar(value, colType);
+                const current = value[0] === undefined || value[0] === null
+                    ? (fallback === undefined ? '' : fallback) : value[0];
+                // SP native updateRow/insertRow 直接保存传入值，不会替我们归一化布尔值。
+                if (colType === 'boolean' && typeof current === 'boolean') return current ? 1 : 0;
+                if (colType === 'number' || colType === 'boolean') return current;
+                return String(current);
+            }
+            if (Array.isArray(value) || (value !== null && typeof value === 'object')) {
+                try { const encoded = JSON.stringify(value); return encoded === undefined ? '' : encoded; } catch (e) { return String(value); }
+            }
+            return value;
+        };
+        const colDefOf = (layout, col) => {
+            if (!layout || !Array.isArray(layout.cols) || col === undefined || col === null) return null;
+            return layout.cols.find(c => c && c[0] === col) || null;
+        };
+        // 一次性编码所有待写单元格：同一次 updateRow、insertRow、updateCell 与
+        // importTableAsJson 都从这里取值，避免某条路径漏编码又把数组交给宿主。
+        for (const r of resolved) {
+            if (!r || r.kind === 'row-delete') continue;
+            if (r.kind === 'array' || r.kind === 'nested-array') {
+                // 数组元素已有自己的 JSON 标量编码（encodeArrayItem）；这里只在值列被
+                // 声明为 pair 列时取出当前值，其余类型保持原样，避免重复编码。
+                const vc = r.layout && r.layout.valueCol;
+                const vcDef = colDefOf(r.layout, vc);
+                const vcType = vcDef ? String(vcDef[1] || '') : '';
+                const vcPair = pairColumnType(vcDef);
+                if (vcPair) r.arr = (Array.isArray(r.arr) ? r.arr : []).map(v => boundaryEncode(v, vcPair, vcType, vcDef ? vcDef[2] : undefined));
+                continue;
+            }
+            if (r.newRowArr) {
+                for (let ci = 1; ci < r.newRowArr.length; ci++) {
+                    const col = r.header ? r.header[ci] : undefined;
+                    const def = colDefOf(r.layout, col);
+                    const type = def ? String(def[1] || '') : '';
+                    // 新行的单元格已由 newRows.cells 按列类型编码过；这里只处理
+                    // 布局声明为 pair 的列（其值是 [当前值, 说明] 叶子）。
+                    const pair = pairColumnType(def);
+                    if (!pair) continue;
+                    // newRows 合并时 arr 已转为字符串，原始 pair 仍保留在 obj。
+                    // 必须在这里使用原始值，不能把“乙,名称”当成已经编码好的文本。
+                    const raw = r.newRowObj && Object.prototype.hasOwnProperty.call(r.newRowObj, col)
+                        ? r.newRowObj[col] : r.newRowArr[ci];
+                    const encoded = boundaryEncode(raw, pair, type, def ? def[2] : undefined);
+                    r.newRowArr[ci] = encoded;
+                    if (r.newRowObj && col !== undefined) r.newRowObj[col] = encoded;
+                }
+                continue;
+            }
+            const cellDef = colDefOf(r.layout, r.colZh);
+            const cellType = cellDef ? String(cellDef[1] || '') : '';
+            r.value = boundaryEncode(r.value, r.pairType || pairColumnType(cellDef), cellType, cellDef ? cellDef[2] : undefined);
+        }
+
+        // pair 的旧比较发生在取当前值之前，导致 [值, 说明] 与标量单元格永远不同。
+        // 编码后再剔除无变化的已有单元格；新行和动态说明的原子写入仍必须保留。
+        let kept = 0;
+        for (const r of resolved) {
+            const pairCell = r.kind === 'cell' && !r.newRowArr && !r.vwdMetaCol
+                && (r.pairType || pairColumnType(colDefOf(r.layout, r.colZh)));
+            const row = pairCell && r.sheet && r.sheet.content && r.sheet.content[r.rowIndex];
+            if (!row || !sameValue(row[r.colIdx], r.value)) resolved[kept++] = r;
+        }
+        resolved.length = kept;
+
+        // 多行删除时，先删的行会让后续行索引前移：按行索引降序执行删除，
+        // 避免整组替换行表（如切换开场分支）时误删其他行。
+        resolved.sort((a, b) => {
+            if (a.kind === 'row-delete' && b.kind === 'row-delete') return (b.rowIndex || 0) - (a.rowIndex || 0);
+            if (a.kind === 'row-delete') return 1;
+            if (b.kind === 'row-delete') return -1;
+            return 0;
+        });
+
+        // 数组不能沿用过去的“删光再插入”路径：其中任一个 CRUD 失败都会留下半份数组。
+        // 先把所有数组替换转成针对当前行的最小计划；计划多于一步时由一次整表 import
+        // 提交，插件会把该 import 当作一笔原子持久化事务。
+        planningRows = false;
+        const arrayResolved = resolved.filter(r => r.kind === 'array' || r.kind === 'nested-array');
+        const arrayPlans = [];
+        const expectedArraySheets = new Map();
+        const nextArrayRowIds = new Map();
+        const encodeArrayItem = (r, value) => {
+            if (r.isJsonScalarArray) {
+                try { const encoded = JSON.stringify(value); return encoded === undefined ? 'null' : encoded; } catch (e) { return 'null'; }
+            }
+            const valueDef = (r.layout.cols || []).find(c => c[0] === (r.layout.valueCol || '内容'));
+            if (valueDef?.[1] === 'boolean') return value ? '1' : '0';
+            if (value && typeof value === 'object') {
+                try { return JSON.stringify(value); } catch (e) { return 'null'; }
+            }
+            return String(value);
+        };
+        for (const r of arrayResolved) {
+            if (r.valueIdx < 0 || (r.kind === 'nested-array' && r.parentIdx < 0)) {
+                markWriteFailure('数组缺少值列或父键列');
+                break;
+            }
+            const targetRows = [];
+            for (let ri = 1; ri < r.sheet.content.length; ri++) {
+                const row = r.sheet.content[ri];
+                if (r.kind !== 'nested-array' || (row && r.parentIdx >= 0 && String(row[r.parentIdx]) === String(r.parentVal))) {
+                    targetRows.push({ rowIndex: ri, row });
+                }
+            }
+            const updates = [], deletes = [], appends = [];
+            const common = Math.min(targetRows.length, r.arr.length);
+            for (let i = 0; i < common; i++) {
+                const value = encodeArrayItem(r, r.arr[i]);
+                if (!sameValue(targetRows[i].row && targetRows[i].row[r.valueIdx], value)) {
+                    updates.push({ rowIndex: targetRows[i].rowIndex, col: r.layout.valueCol || r.header[1] || '内容', value });
+                }
+            }
+            let maxRowId = nextArrayRowIds.get(r.key) || 0;
+            const rowIdIdx = r.header.indexOf('row_id');
+            for (let ri = 1; ri < r.sheet.content.length; ri++) {
+                const n = Number(r.sheet.content[ri] && r.sheet.content[ri][rowIdIdx >= 0 ? rowIdIdx : 0]);
+                if (Number.isFinite(n) && n > maxRowId) maxRowId = n;
+            }
+            for (let i = common; i < r.arr.length; i++) {
+                const row = new Array(r.header.length).fill('');
+                if (rowIdIdx >= 0) row[rowIdIdx] = String(++maxRowId);
+                if (r.kind === 'nested-array' && r.parentIdx >= 0) row[r.parentIdx] = String(r.parentVal);
+                if (r.valueIdx >= 0) row[r.valueIdx] = encodeArrayItem(r, r.arr[i]);
+                appends.push({ row });
+            }
+            nextArrayRowIds.set(r.key, maxRowId);
+            for (let i = targetRows.length - 1; i >= r.arr.length; i--) deletes.push({ rowIndex: targetRows[i].rowIndex });
+            arrayPlans.push({ r, updates, deletes, appends });
+            if (!expectedArraySheets.has(r.key)) expectedArraySheets.set(r.key, JSON.stringify(r.sheet.content));
+        }
+        // 父行删除与同张子数组表的其他更新共用计划，避免数组先删行后级联仍用旧行号。
+        for (const r of deletions) {
+            if (r.layout.kind !== 'nestedArray') continue;
+            let plan = arrayPlans.find(p => p.r.key === r.key);
+            if (!plan) { plan = { r, updates: [], deletes: [], appends: [] }; arrayPlans.push(plan); }
+            if (!plan.deletes.some(op => op.rowIndex === r.rowIndex)) plan.deletes.push({ rowIndex: r.rowIndex });
+            if (!expectedArraySheets.has(r.key)) expectedArraySheets.set(r.key, JSON.stringify(r.sheet.content));
+            r.arrayDeletion = true;
+        }
+        const arrayOperationCount = arrayPlans.reduce((n, p) => n + p.updates.length + p.deletes.length + p.appends.length, 0);
+        const arrayResultFailed = (value) => value === false || value === -1 || value === null || value === undefined;
+        const readUnchangedArrayTables = () => {
+            let latest;
+            try { latest = api.exportTableAsJson() || {}; } catch (e) { markWriteFailure('数组 exportTableAsJson', e); return null; }
+            for (const [key, expected] of expectedArraySheets) {
+                const current = latest[key];
+                if (!current || JSON.stringify(current.content) !== expected) {
+                    markWriteFailure('数组表在规划后已变化，等待重试');
+                    return null;
+                }
+            }
+            return latest;
+        };
+        if (arrayOperationCount > 0 && !abortWrites) {
+            if (arrayOperationCount > 1 && typeof api.importTableAsJson !== 'function') {
+                markWriteFailure('数组写入需要 importTableAsJson');
+            } else {
+                const latest = readUnchangedArrayTables();
+                if (latest) {
+                    if (arrayOperationCount === 1) {
+                        const p = arrayPlans.find(x => x.updates.length || x.deletes.length || x.appends.length);
+                        const L = p.r.layout;
+                        try {
+                            let result;
+                            if (p.updates.length) {
+                                const op = p.updates[0];
+                                result = await Promise.resolve(api.updateCell(L.table, op.rowIndex, op.col, op.value));
+                            } else if (p.deletes.length) {
+                                result = await Promise.resolve(api.deleteRow(L.table, p.deletes[0].rowIndex));
+                            } else {
+                                const obj = {};
+                                p.r.header.forEach((h, i) => { if (p.appends[0].row[i] !== '') obj[h] = p.appends[0].row[i]; });
+                                result = await Promise.resolve(api.insertRow(L.table, obj));
+                            }
+                            if (arrayResultFailed(result)) markWriteFailure('数组单步 CRUD(' + L.table + ')');
+                        } catch (e) { markWriteFailure('数组单步 CRUD(' + L.table + ')', e); }
+                    } else {
+                        // JSON 克隆既避免改动 export 的宿主引用，也保留无关 sheet、列和 nested
+                        // array 的其他 parent 行。删除统一倒序，保证计划时的行号仍然有效。
+                        let candidate;
+                        try { candidate = JSON.parse(JSON.stringify(latest)); } catch (e) { markWriteFailure('数组快照克隆', e); }
+                        if (candidate) {
+                            try {
+                                const allUpdates = [], allDeletes = [], allAppends = [];
+                                for (const p of arrayPlans) {
+                                    for (const op of p.updates) allUpdates.push({ key: p.r.key, op });
+                                    for (const op of p.deletes) allDeletes.push({ key: p.r.key, op });
+                                    for (const op of p.appends) allAppends.push({ key: p.r.key, op });
+                                }
+                                for (const item of allUpdates) {
+                                    const sheet = candidate[item.key]; const ci = sheet && sheet.content[0].indexOf(item.op.col);
+                                    if (!sheet || ci < 0 || !sheet.content[item.op.rowIndex]) throw new Error('数组更新目标已不存在');
+                                    sheet.content[item.op.rowIndex][ci] = item.op.value;
+                                }
+                                allDeletes.sort((a, b) => a.key === b.key ? b.op.rowIndex - a.op.rowIndex : a.key.localeCompare(b.key));
+                                for (const item of allDeletes) candidate[item.key].content.splice(item.op.rowIndex, 1);
+                                for (const item of allAppends) candidate[item.key].content.push(item.op.row);
+                                const imported = await Promise.resolve(api.importTableAsJson(JSON.stringify(candidate)));
+                                if (!(imported === true || (imported && imported.success === true))) markWriteFailure('数组 importTableAsJson');
+                            } catch (e) { markWriteFailure('数组 importTableAsJson', e); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 原生 CRUD 写入：同一既有行的多个单元格优先合并为一次 updateRow，避免插件为
+        // 每个 updateCell 都执行一次完整 V2 持久化；旧版插件或行更新失败时逐格回退。
+        // insertRow/deleteRow 仍逐条执行，保持行结构变更与回放语义不变。
+        // row_upsert/row_delete 操作，回放确定性恢复。不使用 executeSqlBatch——那会存成
+        // sql_sheet_batch（回放重跑 SQL），且批量 DELETE 误删时无法恢复（实测丢行根因）。
+        // 批量性能由插件的提交管线与酒馆保存防抖兜底。
+        const consumedCellUpdates = new Set();
+        let updateRowUsable = typeof api.updateRow === 'function';
+        const cellUpdatesByRow = new Map();
+        for (const candidate of resolved) {
+            if (candidate.kind !== 'cell' || candidate.newRowObj || !candidate.layout) continue;
+            const key = candidate.layout.table + '\u0000' + candidate.rowIndex;
+            const group = cellUpdatesByRow.get(key) || [];
+            group.push(candidate);
+            cellUpdatesByRow.set(key, group);
+        }
+        for (const r of resolved) {
+            if (abortWrites) break;
+            if (consumedCellUpdates.has(r)) continue;
+            const L = r.layout;
+            try {
+                if (r.kind === 'row-delete') {
+                    if (r.arrayDeletion) continue;
+                    try {
+                        const ok = await Promise.resolve(api.deleteRow(L.table, r.rowIndex));
+                        if (!ok) markWriteFailure('deleteRow(' + L.table + ')');
+                    } catch (e) { markWriteFailure('deleteRow(' + L.table + ')', e); }
+                    continue;
+                }
+                if (r.kind === 'array' || r.kind === 'nested-array') continue;
+                if (r.newRowObj) {
+                    // 行表 INSERT 前检查：若持久化帧里该表已有同键行，说明运行时仅表头只是
+                    // 插件回放未完成（切聊天/刷新窗口）。此刻 insertRow 会造出重复行，
+                    // 回放完成后 row_id 错位 → 触发插件“手动追平完整性校验失败”/多余行。
+                    // 跳过并标记失败，由合并层延迟重试等回放完成。
+                    if (persistedTables && typeof persistedTables === 'object') {
+                        const pSheet2 = Object.values(persistedTables).find(s => s && s.name === L.table);
+                        if (pSheet2 && Array.isArray(pSheet2.content) && pSheet2.content.length > 1) {
+                            const ancestorCols = L.kind === 'nestedRows'
+                                ? (L.ancestorKeyCols && L.ancestorKeyCols.length ? L.ancestorKeyCols : [L.parentKeyCol]) : [];
+                            const dupKey = L.kind === 'nestedRows'
+                                ? findRelationRowByAncestors(pSheet2, L, ancestorCols.map(col => r.newRowObj[col]), r.newRowObj[L.keyCol]) >= 1
+                                : findRowByColumn(pSheet2, L.keyCol, r.newRowObj[L.keyCol]) >= 1;
+                            if (dupKey) {
+                                dbg(' 行表「' + L.table + '」持久化已有键「' + r.newRowObj[L.keyCol] + '」而运行时空（回放中），跳过 INSERT 稍后重试。');
+                                noteWriteFailure('回放窗口，跳过写入稍后重试');
+                                continue;
+                            }
+                        }
+                    }
+                    try {
+                        const ir = await Promise.resolve(api.insertRow(L.table, r.newRowObj));
+                        if (ir === -1 || ir === false || ir === undefined || ir === null) markWriteFailure('insertRow(' + L.table + ')');
+                    } catch (e) { markWriteFailure('insertRow(' + L.table + ')', e); }
+                    continue;
+                }
+                try {
+                    // 单例/JSON 表 updateCell 前检查：运行时仅表头（回放未完成）而持久化已有
+                    // 该表数据行时，updateCell 必然越界报错（Row index 1 out of bounds）且插件
+                    // 日志刷屏。直接跳过并标记失败，由合并层延迟重试（等插件回放完成）。
+                    if (r.rowIndex >= 1 && r.sheet && Array.isArray(r.sheet.content) && r.sheet.content.length <= 1) {
+                        if (persistedTables && typeof persistedTables === 'object') {
+                            const pSheet3 = Object.values(persistedTables).find(s => s && s.name === L.table);
+                            if (pSheet3 && Array.isArray(pSheet3.content) && pSheet3.content.length > 1) {
+                                dbg(' 表「' + L.table + '」运行时仅表头而持久化已有数据行（回放窗口），跳过 updateCell 稍后重试。');
+                                noteWriteFailure('回放窗口，跳过写入稍后重试');
+                                continue;
+                            }
+                        }
+                    }
+                    // updateRow 的 payload 是 { 列名: 新值 }。仅合并同表同一现有行的普通
+                    // cell 操作；INSERT/DELETE/数组替换与动态 JSON 合并继续保持原顺序。
+                    const group = cellUpdatesByRow.get(L.table + '\u0000' + r.rowIndex) || [r];
+                    const sameRow = [];
+                    if (updateRowUsable) for (const x of group) if (x !== r && !consumedCellUpdates.has(x)) sameRow.push(x);
+                    let ok = false;
+                    // VWD：值和说明必须一次提交。updateRow 不可用时整笔拒绝，绝不先写值
+                    // 再单独写说明（否则会出现“新值 + 旧说明”）。
+                    const vwdCols = [r.vwdMetaCol, ...sameRow.map(x => x.vwdMetaCol)].filter(Boolean);
+                    const needsUpdateRow = !!r.vwdMeta;
+                    if (needsUpdateRow && !updateRowUsable) {
+                        markWriteFailure('动态说明需要 updateRow 才能与值一起提交（表「' + L.table + '」）');
+                        continue;
+                    }
+                    if (sameRow.length > 0 && updateRowUsable) {
+                        const payload = { [r.colZh]: r.value };
+                        for (const x of sameRow) payload[x.colZh] = x.value;
+                        for (const col of vwdCols) payload[col] = r.vwdMetaCol === col ? r.vwdMetaValue : (sameRow.find(x => x.vwdMetaCol === col) || {}).vwdMetaValue;
+                        try {
+                            ok = !!(await Promise.resolve(api.updateRow(L.table, r.rowIndex, payload)));
+                        } catch (e) { ok = false; }
+                        if (ok) for (const x of sameRow) consumedCellUpdates.add(x);
+                        else updateRowUsable = false;
+                    } else if (r.vwdMeta) {
+                        // 只改说明：一次 updateRow 同时带上元数据列与当前值列，保持与
+                        // “值和说明一起改”相同的提交形状。
+                        const payload = {};
+                        if (r.vwdValueCol) payload[r.vwdValueCol] = r.vwdValue;
+                        payload[r.colZh] = r.value;
+                        try {
+                            ok = !!(await Promise.resolve(api.updateRow(L.table, r.rowIndex, payload)));
+                        } catch (e) { ok = false; }
+                        if (ok) consumedCellUpdates.add(r);
+                        else updateRowUsable = false;
+                    }
+                    if (!ok) {
+                        if (needsUpdateRow) {
+                            markWriteFailure('动态说明与值未能原子提交（表「' + L.table + '」）');
+                            continue;
+                        }
+                        ok = !!(await Promise.resolve(api.updateCell(L.table, r.rowIndex, r.colZh, r.value)));
+                    }
+                    if (!ok) {
+                        markWriteFailure('updateCell(' + L.table + ')');
+                        if (mvu2ledgerDebugOn()) {
+                            dbg(' updateCell 失败: ' + L.table + ' row=' + r.rowIndex + ' col=' + r.colZh +
+                                ' 运行时行数=' + (Array.isArray(r.sheet && r.sheet.content) ? r.sheet.content.length : 0));
+                        }
+                    }
+                } catch (e) { markWriteFailure('updateCell(' + L.table + ')', e); }
+            } catch (e) { markWriteFailure('写入 ' + L.table, e); }
+        }
+        await runDirectOps();
+        return resolved.length + directOps.length;
+
+        async function runDirectOps() {
+            let latestTables;
+            if (deletions.length && directOps.some(d => d.kind === 'overflow' || d.kind === 'overflow-remove') && typeof api.exportTableAsJson === 'function') {
+                latestTables = await Promise.resolve(api.exportTableAsJson());
+            }
+            for (const d of directOps) {
+                if (abortWrites) break;
+                try {
+                    if (d.kind === 'json') {
+                        // 整组 JSON 表同样可能在回放窗口仅表头：持久化已有行而运行时为空时跳过，
+                        // 由合并层延迟重试（否则 updateCell(…, 1, …) 越界刷屏）。
+                        if (persistedTables && typeof persistedTables === 'object') {
+                            const pSheetJ = Object.values(persistedTables).find(s => s && s.name === d.layout.table);
+                            if (pSheetJ && Array.isArray(pSheetJ.content) && pSheetJ.content.length > 1 &&
+                                (!d.sheet || !Array.isArray(d.sheet.content) || d.sheet.content.length <= 1)) {
+                                dbg(' JSON表「' + d.layout.table + '」运行时仅表头而持久化已有数据行（回放窗口），跳过写入稍后重试。');
+                                noteWriteFailure('回放窗口，跳过写入稍后重试');
+                                continue;
+                            }
+                        }
+                        const jok = await Promise.resolve(api.updateCell(d.layout.table, 1, '内容', d.value));
+                        if (!jok) markWriteFailure('JSON updateCell(' + d.layout.table + ')');
+                    } else if (d.kind === 'overflow' || d.kind === 'overflow-remove') {
+                        // Earlier row deletions may move the target. Locate by business
+                        // identity again instead of writing to the old physical index.
+                        d.sheet = latestTables && Object.values(latestTables).find(sheet => sheet && sheet.name === d.layout.table) || d.sheet;
+                        if (d.layout.kind === 'rows' || d.layout.kind === 'nestedRows') {
+                            d.rowIndex = d.layout.kind === 'nestedRows'
+                                ? findRelationRowByAncestors(d.sheet, d.layout, d.ancestorValues, d.rowKey)
+                                : findRowByColumn(d.sheet, d.layout.keyCol, d.rowKey);
+                            if (d.rowIndex < 1) throw new Error('动态字段目标行已不存在');
+                        }
+                        // 同一次写入可能同时有“改动态字段”和“删动态字段”：必须读当前单元格再
+                        // 合并/删除，不能直接覆盖整列（否则先写后删会把本次新增也抹掉）。
+                        const curRow = d.sheet && d.sheet.content && d.sheet.content[d.rowIndex];
+                        const ovcIdx = curRow && Array.isArray(d.header) ? d.header.indexOf(d.layout.overflowCol || '_扩展数据') : -1;
+                        if (curRow && ovcIdx !== -1) {
+                            const cur = parseObj(curRow[ovcIdx]);
+                            if (d.kind === 'overflow-remove') {
+                                const path = d.mergePath || [d.removeKey];
+                                let owner = cur;
+                                for (const part of path.slice(0, -1)) owner = owner && owner[part];
+                                if (owner && typeof owner === 'object') delete owner[path.at(-1)];
+                            }
+                            else setNestedValue(cur, d.mergePath || [d.mergeKey], d.value);
+                            const out = JSON.stringify(cur);
+                            if (!sameValue(curRow[ovcIdx], out)) {
+                                const ook = await Promise.resolve(api.updateCell(d.layout.table, d.rowIndex, d.layout.overflowCol || '_扩展数据', out));
+                                if (!ook) markWriteFailure('溢出列 updateCell(' + d.layout.table + ')');
+                                else curRow[ovcIdx] = out;
+                            }
+                        }
+                    } else if (d.kind === 'overflow-insert') {
+                        const oir = await Promise.resolve(api.insertRow(d.layout.table, d.rowObj));
+                        if (oir === -1 || oir === false || oir === undefined || oir === null) markWriteFailure('溢出行 insertRow(' + d.layout.table + ')');
+                    }
+                } catch (e) {
+                    markWriteFailure('整组JSON/溢出列写入', e);
+                    dbgWarn(' 整组JSON/溢出列写入失败:', e);
+                }
+            }
+        }
+    }
+    function normalizeDraftCell(value) {
+        return value === null || value === undefined ? '' : typeof value === 'boolean' ? (value ? 1 : 0) : typeof value === 'object' ? JSON.stringify(value) : value;
+    }
+    function sameRepresentation(a, b) {
+        if (Object.is(a, b)) return true;
+        if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false;
+        const keys = Object.keys(a);
+        return keys.length === Object.keys(b).length && keys.every(key => Object.prototype.hasOwnProperty.call(b, key) && sameRepresentation(a[key], b[key]));
+    }
+    function createTableDraft(baseTemplate, sourceApi) {
+        const tables = JSON.parse(JSON.stringify(baseTemplate || {}));
+        const operations = [];
+        const fakeApi = {
+            exportTableAsJson: () => tables,
+            importTableAsJson: async json => {
+                const candidate = JSON.parse(json);
+                for (const key of Object.keys(tables)) delete tables[key];
+                Object.assign(tables, candidate);
+                return true;
+            },
+            updateCell: async (tableName, rowIndex, col, value) => {
+                const s = Object.values(tables).find(x => x && x.name === tableName);
+                if (!s || !s.content[rowIndex]) return false;
+                const ci = s.content[0].indexOf(col);
+                if (ci === -1) return false;
+                s.content[rowIndex][ci] = normalizeDraftCell(value);
+                return true;
+            },
+            updateRow: async (tableName, rowIndex, payload) => {
+                const s = Object.values(tables).find(x => x && x.name === tableName);
+                if (!s || !s.content[rowIndex] || !payload || typeof payload !== 'object') return false;
+                if (Object.keys(payload).some(col => s.content[0].indexOf(col) < 0)) return false;
+                for (const col of Object.keys(payload)) {
+                    const ci = s.content[0].indexOf(col);
+                    if (ci >= 0) s.content[rowIndex][ci] = normalizeDraftCell(payload[col]);
+                }
+                return true;
+            },
+            insertRow: async (tableName, obj) => {
+                const s = Object.values(tables).find(x => x && x.name === tableName);
+                if (!s) return -1;
+                const row = s.content[0].map(h => '');
+                for (const k of Object.keys(obj || {})) {
+                    const ci = s.content[0].indexOf(k);
+                    if (ci >= 0) row[ci] = normalizeDraftCell(obj[k]);
+                }
+                // 行号取现有最大行号 +1：deleteRow 发生后 content.length 会与已有
+                // 行号重复（row[0] 是主键列），重复主键会让整表导入被拒或产生重复行。
+                let maxRowId = 0;
+                for (let ri = 1; ri < s.content.length; ri++) {
+                    const rn = Number(s.content[ri] && s.content[ri][0]);
+                    if (Number.isFinite(rn) && rn > maxRowId) maxRowId = rn;
+                }
+                row[0] = maxRowId + 1;
+                s.content.push(row);
+                return row[0];
+            },
+            deleteRow: async (tableName, rowIndex) => {
+                const s = Object.values(tables).find(x => x && x.name === tableName);
+                if (!s || !s.content[rowIndex]) return false;
+                s.content.splice(rowIndex, 1);
+                return true;
+            },
+        };
+        if (sourceApi) {
+            if (typeof sourceApi.updateRow !== 'function') delete fakeApi.updateRow;
+            if (typeof sourceApi.getTableTemplate === 'function') fakeApi.getTableTemplate = (...args) => sourceApi.getTableTemplate(...args);
+            for (const method of ['updateCell', 'updateRow', 'insertRow', 'deleteRow', 'importTableAsJson']) {
+                const apply = fakeApi[method];
+                if (!apply) continue;
+                fakeApi[method] = async (...args) => {
+                    // import 的最终内容统一取 tables，不额外保留整份 JSON 字符串。
+                    const savedArgs = method === 'importTableAsJson' ? null : JSON.parse(JSON.stringify(args));
+                    const result = await apply(...args);
+                    operations.push({ method, args: savedArgs });
+                    return result;
+                };
+            }
+        }
+        return { tables, fakeApi, operations };
+    }
+
+    async function planStatDiffToDb(api, layoutEntries, prevStat, nextStat, persistedTables) {
+        const before = api.exportTableAsJson() || {};
+        const beforeJson = JSON.stringify(before);
+        const draft = createTableDraft(before, api);
+        const state = { failed: false, failureReason: null };
+        const plannedChanges = await runStatDiffWrite(draft.fakeApi, layoutEntries, prevStat, nextStat, persistedTables, state);
+        if (!state.failed && (layoutEntries || []).some(entry => entry.requireLosslessWrite)) {
+            const actual = typeof readStatFromTables === 'function' ? readStatFromTables(layoutEntries, draft.tables)?.stat_data : undefined;
+            if (!sameRepresentation(nextStat, actual)) {
+                state.failed = true;
+                state.failureCode = 'MVU_STAT_REPRESENTATION_UNSUPPORTED';
+                state.failureReason = '精细布局无法无损保存本次替换的结构或类型；已拒绝写入并保留原数据';
+            }
+        }
+        return { ok: !state.failed, plannedChanges, failureReason: state.failureReason, ...(state.failureCode ? { failureCode: state.failureCode } : {}),
+            tables: draft.tables, operations: draft.operations, beforeJson };
+    }
+    async function writeStatDiffToDbResult(api, layoutEntries, prevStat, nextStat, persistedTables) {
+        if ((layoutEntries || []).some(entry => entry.requireLosslessWrite)) {
+            const plan = await planStatDiffToDb(api, layoutEntries, prevStat, nextStat, persistedTables);
+            if (!plan.ok) return { ok: false, plannedChanges: 0, failureReason: plan.failureReason, ...(plan.failureCode ? { failureCode: plan.failureCode } : {}) };
+        }
+        const state = { failed: false, failureReason: null };
+        const plannedChanges = await runStatDiffWrite(api, layoutEntries, prevStat, nextStat, persistedTables, state);
+        return { ok: !state.failed, plannedChanges, failureReason: state.failureReason };
+    }
+    async function writeStatDiffToDb(api, layoutEntries, prevStat, nextStat, persistedTables) {
+        statWriteHadFailure = false;
+        const result = await writeStatDiffToDbResult(api, layoutEntries, prevStat, nextStat, persistedTables);
+        statWriteHadFailure = !result.ok;
+        return result.plannedChanges;
+    }
+
+    return { unmappedStatGroups, createTableDraft, planStatDiffToDb, writeStatDiffToDb, writeStatDiffToDbResult, get lastStatWriteFailed() { return statWriteHadFailure; } };
+}
+
+if (typeof module !== 'undefined' && module.exports) module.exports = createTableWriter;
