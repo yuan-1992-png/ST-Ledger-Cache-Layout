@@ -34,56 +34,56 @@
         {
           "name": "恋爱对象表",
           "headers": "row_id|姓名|性别|生日|一句话介绍|外貌特征|身份|语言风格和口癖|对主角态度|过往经历|最近亲密互动",
-          "ruleHash": "926cdd06:de512b76",
-          "ruleChars": 2059
+          "ruleHash": "b36c63eb:e281ea89",
+          "ruleChars": 2181
         },
         {
           "name": "重要角色表",
           "headers": "row_id|姓名|性别|生日|一句话介绍|外貌特征|身份|语言风格和口癖|对主角态度|过往经历",
-          "ruleHash": "4a921a50:7a77b796",
-          "ruleChars": 989
+          "ruleHash": "31a8f0f1:4998429",
+          "ruleChars": 1111
         },
         {
           "name": "人物关系表",
           "headers": "row_id|人物A|人物B|关系类型|相互看法|起因备注|关系状态",
-          "ruleHash": "117951bb:bea9a10d",
-          "ruleChars": 1093
+          "ruleHash": "658c4c50:4a2daa98",
+          "ruleChars": 1363
         },
         {
           "name": "角色里程碑表",
           "headers": "row_id|姓名|里程碑事件",
-          "ruleHash": "d811b7bd:8db53c91",
-          "ruleChars": 1231
+          "ruleHash": "156e79b1:913f0269",
+          "ruleChars": 1478
         },
         {
           "name": "NSFW信息表",
           "headers": "row_id|姓名|身高/体重|三围/罩杯|身材与特异性征|性爱接受度和XP倾向|性经验程度|下体状态|后庭状态|泌乳/体液状态|床上淫语风格|调教值|性爱次数|最近性行为|对主角的称呼",
-          "ruleHash": "2d43b614:9bb3f810",
-          "ruleChars": 1982
+          "ruleHash": "5f789c:1a4555e4",
+          "ruleChars": 2196
         },
         {
           "name": "人物性格偏移表",
           "headers": "row_id|姓名|近期情绪状态|对主角的交互逻辑|被强化的性格侧面|被弱化的性格侧面|行为模式变化",
-          "ruleHash": "78c93a32:3c91894e",
-          "ruleChars": 1800
+          "ruleHash": "35e9c546:579949fa",
+          "ruleChars": 2014
         },
         {
           "name": "在场角色表",
           "headers": "row_id|姓名|当前状态|内心想法|下一步打算|当前穿搭|上装|下装|内衣/内裤|袜子|鞋子|饰品|情绪",
-          "ruleHash": "7008be79:12ca4b55",
-          "ruleChars": 2015
+          "ruleHash": "11c7d272:b1e318aa",
+          "ruleChars": 2279
         },
         {
           "name": "即时生理反应表",
           "headers": "row_id|姓名|胸部|下体|口穴|菊穴|其他部位",
-          "ruleHash": "12c9280b:9f2928bd",
-          "ruleChars": 785
+          "ruleHash": "c731c858:a0179cc2",
+          "ruleChars": 1049
         },
         {
           "name": "恋爱日记表",
           "headers": "row_id|写作角色|关联角色|日记内容|发生时间|事件类型",
-          "ruleHash": "3c62d767:75840895",
-          "ruleChars": 1351
+          "ruleHash": "8c63924e:e5774358",
+          "ruleChars": 1499
         }
       ]
     }
@@ -115,6 +115,6 @@
       ]
     }
   ],
-  "name": "角色组10表 · 真名归并规则",
-  "id": "character-10-reviewed-20261023"
+  "name": "角色组10表 · 跨表真名校验",
+  "id": "character-10-name-sync-20261024"
 }
