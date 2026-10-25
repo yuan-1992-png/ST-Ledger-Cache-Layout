@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "characterAvatar": "",
+  "name": "通用十表 · 本地核对配置",
+  "ledgerVersion": "native-v2 request layout",
+  "groups": [
+    {
+      "id": 1,
+      "name": "角色组",
+      "intro": "【当前台账】\n下面为本轮需要填的表及已有内容：每张表由一行「表 N/M：表名」分隔线框出，只允许填写这里列出的表。\n\n",
+      "signature": [
+        {
+          "index": 0,
+          "role": "system",
+          "hash": "8ffeb400:381a529e"
+        },
+        {
+          "index": 1,
+          "role": "system",
+          "hash": "8738df9f:8aad4427"
+        },
+        {
+          "index": 2,
+          "role": "system",
+          "hash": "9f48f37d:2f9fa36f"
+        }
+      ],
+      "tables": [
+        {
+          "name": "人物信息",
+          "headers": "row_id|姓名|状态",
+          "ruleHash": "3d899972:c32334ae",
+          "ruleChars": 105
+        },
+        {
+          "name": "联系人",
+          "headers": "row_id|姓名|状态",
+          "ruleHash": "2c03c4f7:966e9025",
+          "ruleChars": 104
+        },
+        {
+          "name": "同行者",
+          "headers": "row_id|姓名|状态",
+          "ruleHash": "2558c5ce:45ab1d94",
+          "ruleChars": 104
+        },
+        {
+          "name": "人物关系",
+          "headers": "row_id|姓名|状态",
+          "ruleHash": "b7f851e9:9d3c634d",
+          "ruleChars": 105
+        },
+        {
+          "name": "事件记录",
+          "headers": "row_id|姓名|状态",
+          "ruleHash": "22396743:762a58f",
+          "ruleChars": 105
+        },
+        {
+          "name": "能力档案",
+          "headers": "row_id|姓名|状态",
+          "ruleHash": "b5e3ff5f:270ef379",
+          "ruleChars": 105
+        },
+        {
+          "name": "性格记录",
+          "headers": "row_id|姓名|状态",
+          "ruleHash": "703ef467:4e0f672b",
+          "ruleChars": 105
+        },
+        {
+          "name": "在场人员",
+          "headers": "row_id|姓名|状态",
+          "ruleHash": "712df7e4:ec0fe66a",
+          "ruleChars": 105
+        },
+        {
+          "name": "健康记录",
+          "headers": "row_id|姓名|状态",
+          "ruleHash": "a39b19a0:73bc50cc",
+          "ruleChars": 105
+        },
+        {
+          "name": "交流记录",
+          "headers": "row_id|姓名|状态",
+          "ruleHash": "7114f5:d18f1c03",
+          "ruleChars": 106
+        }
+      ]
+    }
+  ],
+  "skippedGroups": []
+}

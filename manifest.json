@@ -1,12 +1,12 @@
 {
-  "display_name": "台账填表缓存适配",
+  "display_name": "台账填表缓存适配 · 通用格式预览",
   "loading_order": 150,
   "requires": [],
   "optional": [],
   "js": "index.js",
   "css": "style.css",
   "author": "yuan-1992-png",
-  "version": "0.2.1",
-  "homePage": "https://github.com/yuan-1992-png/ST-Ledger-Cache-Layout",
+  "version": "0.3.0-format-preview",
+  "homePage": "https://github.com/yuan-1992-png/ST-Ledger-Cache-Layout/tree/generic-format-preview",
   "auto_update": false
 }

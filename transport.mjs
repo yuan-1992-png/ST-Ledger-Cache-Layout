@@ -1,4 +1,4 @@
-import {transformEnvelope,commonPrefix,normalizeUsage,fingerprint} from './core.mjs';
+import {VERSION,transformEnvelope,commonPrefix,normalizeUsage,fingerprint} from './core.mjs';
 const PATHS=new Set(['/api/backends/chat-completions/generate','/api/plugins/baibaoku/v1/chats/save-generate']);
 async function usage(response,row,report){
  try{
@@ -25,7 +25,7 @@ export function createFetchAdapter(original,{profile,environment,report,baseUrl}
     if(env.enabled){
      const envelope=JSON.parse(init.body),result=transformEnvelope(url.pathname,envelope,typeof profile==='function'?profile():profile,env);
      if(result.groupId!==undefined){
-      row={id:`${Date.now()}-${++serial}`,timestamp:Date.now(),version:'0.2.1',groupId:result.groupId,applied:result.ok,reason:result.reason,status:result.ok?'sent':'unchanged',usage:null};
+      row={id:`${Date.now()}-${++serial}`,timestamp:Date.now(),version:VERSION,groupId:result.groupId,applied:result.ok,reason:result.reason,status:result.ok?'sent':'unchanged',usage:null};
       if(result.ok){
        const body=url.pathname.includes('save-generate')?envelope.generate:envelope;
        const oldText=body.messages[result.index].content,key=fingerprint(String(env.scope||''))+':'+result.groupId;

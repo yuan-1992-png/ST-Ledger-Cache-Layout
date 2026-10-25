@@ -1,4 +1,4 @@
-export const VERSION='0.2.1';
+export const VERSION='0.3.0-format-preview';
 export const MARKER='【台账请求分区 v1】';
 const FIXED=MARKER+'\n【固定表规则区】以下各表的已有数据见后方同名、同编号的数据区；此处不列数据不表示空表。\n\n';
 const DATA='\n【对应已有数据区】按表名及编号对应前方规则；保留原 row_id，空表及未提供数据的说明以各表原文为准。\n\n';

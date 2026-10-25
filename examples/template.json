@@ -1,0 +1,268 @@
+{
+  "schemaVersion": 2,
+  "name": "中性十表样例",
+  "groups": [
+    {
+      "id": 1,
+      "name": "角色组",
+      "frequency": 1
+    },
+    {
+      "id": 2,
+      "name": "其他组",
+      "frequency": 1
+    }
+  ],
+  "tables": [
+    {
+      "tableId": "sheet_test_0",
+      "name": "人物信息",
+      "groupId": 1,
+      "orderNo": 0,
+      "note": "只记录明确事实。更新前在本表核对姓名和 row_id。",
+      "triggerNotes": {
+        "insert": "出现新人物时。",
+        "update": "出现明确变化时。"
+      },
+      "columns": [
+        {
+          "header": "姓名",
+          "type": "text"
+        },
+        {
+          "header": "状态",
+          "type": "text"
+        }
+      ],
+      "readMode": "all",
+      "worldbook": {
+        "enabled": false
+      }
+    },
+    {
+      "tableId": "sheet_test_1",
+      "name": "联系人",
+      "groupId": 1,
+      "orderNo": 1,
+      "note": "只记录明确事实。更新前在本表核对姓名和 row_id。",
+      "triggerNotes": {
+        "insert": "出现新人物时。",
+        "update": "出现明确变化时。"
+      },
+      "columns": [
+        {
+          "header": "姓名",
+          "type": "text"
+        },
+        {
+          "header": "状态",
+          "type": "text"
+        }
+      ],
+      "readMode": "all",
+      "worldbook": {
+        "enabled": false
+      }
+    },
+    {
+      "tableId": "sheet_test_2",
+      "name": "同行者",
+      "groupId": 1,
+      "orderNo": 2,
+      "note": "只记录明确事实。更新前在本表核对姓名和 row_id。",
+      "triggerNotes": {
+        "insert": "出现新人物时。",
+        "update": "出现明确变化时。"
+      },
+      "columns": [
+        {
+          "header": "姓名",
+          "type": "text"
+        },
+        {
+          "header": "状态",
+          "type": "text"
+        }
+      ],
+      "readMode": "all",
+      "worldbook": {
+        "enabled": false
+      }
+    },
+    {
+      "tableId": "sheet_test_3",
+      "name": "人物关系",
+      "groupId": 1,
+      "orderNo": 3,
+      "note": "只记录明确事实。更新前在本表核对姓名和 row_id。",
+      "triggerNotes": {
+        "insert": "出现新人物时。",
+        "update": "出现明确变化时。"
+      },
+      "columns": [
+        {
+          "header": "姓名",
+          "type": "text"
+        },
+        {
+          "header": "状态",
+          "type": "text"
+        }
+      ],
+      "readMode": "all",
+      "worldbook": {
+        "enabled": false
+      }
+    },
+    {
+      "tableId": "sheet_test_4",
+      "name": "事件记录",
+      "groupId": 1,
+      "orderNo": 4,
+      "note": "只记录明确事实。更新前在本表核对姓名和 row_id。",
+      "triggerNotes": {
+        "insert": "出现新人物时。",
+        "update": "出现明确变化时。"
+      },
+      "columns": [
+        {
+          "header": "姓名",
+          "type": "text"
+        },
+        {
+          "header": "状态",
+          "type": "text"
+        }
+      ],
+      "readMode": "all",
+      "worldbook": {
+        "enabled": false
+      }
+    },
+    {
+      "tableId": "sheet_test_5",
+      "name": "能力档案",
+      "groupId": 1,
+      "orderNo": 5,
+      "note": "只记录明确事实。更新前在本表核对姓名和 row_id。",
+      "triggerNotes": {
+        "insert": "出现新人物时。",
+        "update": "出现明确变化时。"
+      },
+      "columns": [
+        {
+          "header": "姓名",
+          "type": "text"
+        },
+        {
+          "header": "状态",
+          "type": "text"
+        }
+      ],
+      "readMode": "all",
+      "worldbook": {
+        "enabled": false
+      }
+    },
+    {
+      "tableId": "sheet_test_6",
+      "name": "性格记录",
+      "groupId": 1,
+      "orderNo": 6,
+      "note": "只记录明确事实。更新前在本表核对姓名和 row_id。",
+      "triggerNotes": {
+        "insert": "出现新人物时。",
+        "update": "出现明确变化时。"
+      },
+      "columns": [
+        {
+          "header": "姓名",
+          "type": "text"
+        },
+        {
+          "header": "状态",
+          "type": "text"
+        }
+      ],
+      "readMode": "all",
+      "worldbook": {
+        "enabled": false
+      }
+    },
+    {
+      "tableId": "sheet_test_7",
+      "name": "在场人员",
+      "groupId": 1,
+      "orderNo": 7,
+      "note": "只记录明确事实。更新前在本表核对姓名和 row_id。",
+      "triggerNotes": {
+        "insert": "出现新人物时。",
+        "update": "出现明确变化时。"
+      },
+      "columns": [
+        {
+          "header": "姓名",
+          "type": "text"
+        },
+        {
+          "header": "状态",
+          "type": "text"
+        }
+      ],
+      "readMode": "all",
+      "worldbook": {
+        "enabled": false
+      }
+    },
+    {
+      "tableId": "sheet_test_8",
+      "name": "健康记录",
+      "groupId": 1,
+      "orderNo": 8,
+      "note": "只记录明确事实。更新前在本表核对姓名和 row_id。",
+      "triggerNotes": {
+        "insert": "出现新人物时。",
+        "update": "出现明确变化时。"
+      },
+      "columns": [
+        {
+          "header": "姓名",
+          "type": "text"
+        },
+        {
+          "header": "状态",
+          "type": "text"
+        }
+      ],
+      "readMode": "all",
+      "worldbook": {
+        "enabled": false
+      }
+    },
+    {
+      "tableId": "sheet_test_9",
+      "name": "交流记录",
+      "groupId": 1,
+      "orderNo": 9,
+      "note": "只记录明确事实。更新前在本表核对姓名和 row_id。",
+      "triggerNotes": {
+        "insert": "出现新人物时。",
+        "update": "出现明确变化时。"
+      },
+      "columns": [
+        {
+          "header": "姓名",
+          "type": "text"
+        },
+        {
+          "header": "状态",
+          "type": "text"
+        }
+      ],
+      "readMode": "all",
+      "worldbook": {
+        "enabled": false
+      }
+    }
+  ]
+}

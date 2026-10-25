@@ -1,0 +1,32 @@
+{
+  "version": "0.3.0-format-preview",
+  "automatedFormatTests": 14,
+  "realLedgerCompiler": {
+    "passed": true,
+    "ledgerVersion": "1.165",
+    "nativeSchemaV2": true,
+    "realDossierCompiler": true,
+    "neutralTables": 10,
+    "samples": 2,
+    "jsonValuesPreserved": true,
+    "liveChatRead": false,
+    "liveFilesModified": false,
+    "realAiRequested": false
+  },
+  "browserUi": {
+    "passed": true,
+    "defaultDisabled": true,
+    "emptyProfileBlocked": true,
+    "tenTableImport": true,
+    "explicitBinding": true,
+    "forwardedOnce": true,
+    "disableRestoresRequest": true,
+    "invalidImportPreservesConfig": true,
+    "noPageErrors": true
+  },
+  "containsPersonalProfile": false,
+  "liveInstallation": false,
+  "published": false,
+  "realGenerationRequested": false,
+  "accuracyEquivalenceProven": false
+}
